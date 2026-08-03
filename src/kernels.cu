@@ -4,6 +4,78 @@
 
 #include "../tester/utils.h"
 
+// =====================================================================
+// CUDA 核函数辅助类型转换工具 (确保同时完美兼容 float 和 half)
+// =====================================================================
+template <typename T> __device__ __forceinline__ float to_float(T val) {
+  return static_cast<float>(val);
+}
+
+template <> __device__ __forceinline__ float to_float<half>(half val) {
+  return __half2float(val);
+}
+
+template <typename T> __device__ __forceinline__ T from_float(float val) {
+  return static_cast<T>(val);
+}
+
+template <> __device__ __forceinline__ half from_float<half>(float val) {
+  return __float2half(val);
+}
+
+// =====================================================================
+// RMSNorm CUDA Kernel 实现
+// =====================================================================
+template <typename T>
+__global__ void rmsNormKernel(const T *input, const T *weight, T *output,
+                              size_t rows, size_t hidden_dim, float eps) {
+  // 每个 Block 负责处理矩阵中的一个 Token (一行)
+  size_t i = blockIdx.x;
+  if (i >= rows)
+    return;
+
+  // 定位当前行的起始指针
+  const T *row_input = input + i * hidden_dim;
+  T *row_output = output + i * hidden_dim;
+
+  // 动态共享内存，用于 Block 内部线程协同求和 (大小由启动时的第三个参数决定)
+  extern __shared__ float sdata[];
+  size_t tid = threadIdx.x;
+
+  // 1. 每个线程并行计算自己分到的那一批元素的平方和
+  float thread_sum = 0.0f;
+  for (size_t j = tid; j < hidden_dim; j += blockDim.x) {
+    float val = to_float(row_input[j]);
+    thread_sum += val * val;
+  }
+  sdata[tid] = thread_sum;
+  __syncthreads(); // 等待全块线程完成局部平方和写入
+
+  // 2. 块内折半规约 (Block Reduction)：将所有线程的和累加到 sdata[0]
+  // 保证 blockDim.x 是 2 的幂次（这里固定为 256），此逻辑绝对安全
+  for (size_t s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  // 3. 由 0 号线程算出这一行的 rsqrt 值，并共享给全块
+  __shared__ float rsqrt_val;
+  if (tid == 0) {
+    float mean_square = sdata[0] / hidden_dim;
+    rsqrt_val = rsqrtf(mean_square + eps); // 使用 CUDA 硬件加速的 rsqrtf 指令
+  }
+  __syncthreads(); // 等待 rsqrt_val 计算并同步完毕
+
+  // 4. 所有线程再次并行，计算当前行每个元素的最终缩放值并写回
+  for (size_t j = tid; j < hidden_dim; j += blockDim.x) {
+    float val = to_float(row_input[j]);
+    float w = to_float(weight[j]);
+    row_output[j] = from_float<T>(val * rsqrt_val * w);
+  }
+}
+
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
  *
@@ -26,28 +98,40 @@ template <typename T>
 void rmsNorm(const std::vector<T> &h_input, const std::vector<T> &h_weight,
              std::vector<T> &h_output, size_t rows, size_t hidden_dim,
              float eps) {
-  // TODO: Implement the rmsNorm function
+  // 1. 定义 Device 端的裸指针
+  T *d_input = nullptr;
+  T *d_weight = nullptr;
+  T *d_output = nullptr;
 
-  // 遍历 rows(batch_size*seq_len)
-  for (size_t i = 0; i < rows; i++) {
-    float square_sum = 0.0f;
-    // 1. 在第 i 行内，先计算所有元素的平方和 (还原你的 mean([i, :]^2) 逻辑)
-    for (size_t j = 0; j < hidden_dim; j++) {
-      float val = static_cast<float>(h_input[i * hidden_dim + j]);
-      square_sum += val * val; // 自乘代替 ^2
-    }
-    // 2. 计算均方根的倒数 (还原你的 rsqrt(mean + eps) 逻辑)
-    float mean_square = square_sum / hidden_dim;
-    float rsqrt_val = 1.0f / std::sqrt(mean_square + eps);
-    // 内层循环：更新当前行的每一个元素，应用缩放
-    for (size_t j = 0; j < hidden_dim; j++) {
-      size_t idx = i * hidden_dim + j;
-      // 注意这里是 h_weight[j]；统一转 float 计算，避免 half 重载歧义
-      h_output[idx] =
-          static_cast<T>(static_cast<float>(h_input[idx]) * rsqrt_val *
-                         static_cast<float>(h_weight[j]));
-    }
-  }
+  size_t input_size = rows * hidden_dim * sizeof(T);
+  size_t weight_size = hidden_dim * sizeof(T);
+
+  // 2. 分配 GPU 显存
+  cudaMalloc(&d_input, input_size);
+  cudaMalloc(&d_weight, weight_size);
+  cudaMalloc(&d_output, input_size);
+
+  // 3. 将数据从 Host (CPU) 拷贝到 Device (GPU)
+  cudaMemcpy(d_input, h_input.data(), input_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_weight, h_weight.data(), weight_size, cudaMemcpyHostToDevice);
+
+  // 4. 配置配置网格和线程块尺寸
+  // 固定使用 256 线程，它是 2 的幂次，能完美支持 Kernel 内部的折半规约
+  unsigned int threads_per_block = 256;
+  unsigned int blocks_per_grid = rows; // 有多少行就启动多少个 Block
+  size_t shared_mem_size = threads_per_block * sizeof(float);
+
+  // 5. 启动 CUDA Kernel
+  rmsNormKernel<T><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+      d_input, d_weight, d_output, rows, hidden_dim, eps);
+
+  // 6. 将计算结果从 GPU 捞回预先分配好的 h_output 中
+  cudaMemcpy(h_output.data(), d_output, input_size, cudaMemcpyDeviceToHost);
+
+  // 7. 善后处理：释放显存防止内存泄漏
+  cudaFree(d_input);
+  cudaFree(d_weight);
+  cudaFree(d_output);
 }
 
 /**
