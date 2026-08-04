@@ -134,6 +134,98 @@ void rmsNorm(const std::vector<T> &h_input, const std::vector<T> &h_weight,
   cudaFree(d_output);
 }
 
+// =====================================================================
+// Falsh Attention CUDA Kernel 实现
+// =====================================================================
+template <typename T>
+__global__ void flashAttentionKernel(const T *q, const T *k, const T *v, T *o,
+                                     int tgt_len, int src_len, int q_heads,
+                                     int kv_heads, int d, bool is_causal) {
+  // 动态共享内存，用于 Block 内部线程协同求和 (大小由启动时的第三个参数决定)
+  extern __shared__ float smem[]; // size = src_len + blockDim.x
+  float *s_score = smem;
+  float *red = smem + src_len; // Reduction 缓冲区
+
+  int b = blockIdx.x;
+  int t = blockIdx.y;
+  int h = blockIdx.z;
+  int hkv = h / (q_heads / kv_heads);   // ← GQA 分组查询注意力
+  float scale = 1.0f / sqrtf((float)d); // ← 1/sqrt(d)
+  int tid = threadIdx.x, nthreads = blockDim.x;
+
+  const T *q_row = q + (((size_t)b * tgt_len + t) * q_heads + h) * d;
+  T *o_row = o + (((size_t)b * tgt_len + t) * q_heads + h) * d;
+  // K/V的第J行起始 = k + (((size_t)b * src_len+j)*kv_heads + hkv)*d; // j 变化
+
+  // ---- 阶段 A: 每个线程负责若干 j, 算 s_j = dot(q, k_j) * scale ----
+  for (int j = tid; j < src_len; j += nthreads) {
+    // 1) causal 时若 j 被 mask, s_shared[j] = -INFINITY, continue
+    // 2) 否则定位 k_row(用 hkv!), 循环 d 维做点积(转 float 累加)
+    //  写进 s_shared[j]
+    if (is_causal && j > t) { // causal mask: 只能看 j <= t
+      s_score[j] = -INFINITY;
+      continue;
+    }
+    const T *k_row = k + (((size_t)b * src_len + j) * kv_heads + hkv) * d;
+    float dot = 0.f;
+    // 在向量特征维度上循环迭代索引
+    for (int dd = 0; dd < d; dd++)
+      dot += to_float(q_row[dd]) * to_float(k_row[dd]);
+    s_score[j] = dot * scale;
+  }
+  __syncthreads();
+
+  // ---- 阶段 B: 求 max —— 就是 rmsNorm 的折半归约, 把 + 换成 fmaxf ----
+  // 每个线程先对自己的 j 集合求局部 max → 写入归约数组 → 折半归约
+  //       结果 m = 全局最大 s_j
+
+  // 找到最大的值
+  float local_max = -INFINITY;
+  for (int j = tid; j < src_len; j += nthreads)
+    local_max = fmaxf(local_max, s_score[j]);
+  red[tid] = local_max;
+  __syncthreads();
+  for (int s = nthreads / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
+  }
+  float m = red[0]; // 全Block都能读
+  __syncthreads();
+
+  // ---- 阶段 C: s_j = exp(s_j - m), 再归约求和得 l ----
+  // 原地改写 s_shared[j] = __expf(s_shared[j] - m)
+  // 再做一次加法归约(和 rmsNorm 一模一样)得到 l
+  float local_sum = 0.f;
+  for (int j = tid; j < src_len; j += nthreads) {
+    float e = __expf(s_score[j] - m);
+    s_score[j] = e;
+    local_sum += e;
+  }
+  red[tid] = local_sum;
+  __syncthreads();
+  for (int s = nthreads / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  float l = red[0];
+  __syncthreads();
+
+  // ---- 阶段 D: 线程按 d 通道分工, o[d] = Σ_j p_j * v[j][d] / l ----
+  for (int dd = threadIdx.x; dd < d; dd += blockDim.x) {
+    float acc = 0.f;
+    // 循环所有 j: acc += s_score[j] * v_row[dd](p_j 最后再除 l)
+    for (int j = 0; j < src_len; j++) {
+      const T *v_row = v + (((size_t)b * src_len + j) * kv_heads + hkv) * d;
+      acc += s_score[j] * to_float(v_row[dd]);
+    }
+    o_row[dd] = from_float<T>(acc / l);
+  }
+}
+
+// Hidden_dim == num_heads * head_dim.
+// query_heads和kv_heads是否相同，则决定了head_dim的大小
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
  *
@@ -161,7 +253,37 @@ void flashAttention(const std::vector<T> &h_q, const std::vector<T> &h_k,
                     int batch_size, int target_seq_len, int src_seq_len,
                     int query_heads, int kv_heads, int head_dim,
                     bool is_causal) {
-  // TODO: Implement the flash attention function
+  // 和 rmsNorm 一模一样的套路，只是换成 4 个张量：
+  T *d_q, *d_k, *d_v, *d_o;
+  size_t q_size =
+      (size_t)batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
+  size_t kv_size =
+      (size_t)batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
+  // cudaMalloc x4 → cudaMemcpy q/k/v → launch → memcpy 回 h_o → cudaFree x4
+  cudaMalloc(&d_q, q_size);
+  cudaMalloc(&d_k, kv_size);
+  cudaMalloc(&d_v, kv_size);
+  cudaMalloc(&d_o, q_size);
+
+  cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_k, h_k.data(), kv_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v, h_v.data(), kv_size, cudaMemcpyHostToDevice);
+
+  // 启动配置：一个 block 负责一个输出行 (b, t, h)
+  // 三维网格，天然映射, 剩下的一个就是head dim
+  dim3 grid(batch_size, target_seq_len, query_heads);
+  int threads = 128;
+  // s_score[src_len] + red[threads] 两块区域，缺一不可！
+  size_t shmem = ((size_t)src_seq_len + threads) * sizeof(float);
+  flashAttentionKernel<T><<<grid, threads, shmem>>>(
+      d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads, kv_heads,
+      head_dim, is_causal);
+
+  cudaMemcpy(h_o.data(), d_o, q_size, cudaMemcpyDeviceToHost);
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_o);
 }
 
 // *********************************************************************
