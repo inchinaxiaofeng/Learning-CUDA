@@ -135,113 +135,93 @@ void rmsNorm(const std::vector<T> &h_input, const std::vector<T> &h_weight,
 }
 
 // =====================================================================
-// Flash Attention CUDA Kernel 实现 (online-softmax / 单遍分块流式)
+// Falsh Attention CUDA Kernel 实现
 // =====================================================================
-// 每个 block 负责一个输出行 (b, t, h);对 K/V 按 tile(大小 = blockDim)
-// 流式扫描,维护 running max(m)/running sum(l)/running 输出累加(acc),
-// 用校正因子 alpha = exp(m_old - m_new) 把旧累加量搬到新基准,
-// 从而单遍完成且数值稳定(任意时刻 exp 参数 <= 0,不溢出)。
-// 线程分工:线程 tid 负责本 tile 的 key j0+tid 的打分;同时若 tid<d
-// 则负责输出通道 dd=tid 的累加(acc 存于寄存器)。要求 d <= blockDim。
 template <typename T>
 __global__ void flashAttentionKernel(const T *q, const T *k, const T *v, T *o,
                                      int tgt_len, int src_len, int q_heads,
                                      int kv_heads, int d, bool is_causal) {
+  // 动态共享内存，用于 Block 内部线程协同求和 (大小由启动时的第三个参数决定)
+  extern __shared__ float smem[]; // size = src_len + blockDim.x
+  float *s_score = smem;
+  float *red = smem + src_len; // Reduction 缓冲区
+
   int b = blockIdx.x;
   int t = blockIdx.y;
   int h = blockIdx.z;
-  int hkv = h / (q_heads / kv_heads); // GQA:多个 query head 共享一个 kv head
-  float scale = 1.0f / sqrtf((float)d); // 1/sqrt(d)(标准正确舍入版)
+  int hkv = h / (q_heads / kv_heads);   // ← GQA 分组查询注意力
+  float scale = 1.0f / sqrtf((float)d); // ← 1/sqrt(d)
   int tid = threadIdx.x, nthreads = blockDim.x;
 
   const T *q_row = q + (((size_t)b * tgt_len + t) * q_heads + h) * d;
   T *o_row = o + (((size_t)b * tgt_len + t) * q_heads + h) * d;
+  // K/V的第J行起始 = k + (((size_t)b * src_len+j)*kv_heads + hkv)*d; // j 变化
 
-  // 共享内存布局: sh_q[d] | sh_p[nthreads] | sh_red[nthreads]
-  extern __shared__ float smem[];
-  float *sh_q = smem;
-  float *sh_p = sh_q + d;
-  float *sh_red = sh_p + nthreads;
-
-  // 把 query 行缓存到共享内存(每个 tile 都要用,避免重复读全局)
-  for (int i = tid; i < d; i += nthreads)
-    sh_q[i] = to_float(q_row[i]);
+  // ---- 阶段 A: 每个线程负责若干 j, 算 s_j = dot(q, k_j) * scale ----
+  for (int j = tid; j < src_len; j += nthreads) {
+    // 1) causal 时若 j 被 mask, s_shared[j] = -INFINITY, continue
+    // 2) 否则定位 k_row(用 hkv!), 循环 d 维做点积(转 float 累加)
+    //  写进 s_shared[j]
+    if (is_causal && j > t) { // causal mask: 只能看 j <= t
+      s_score[j] = -INFINITY;
+      continue;
+    }
+    const T *k_row = k + (((size_t)b * src_len + j) * kv_heads + hkv) * d;
+    float dot = 0.f;
+    // 在向量特征维度上循环迭代索引
+    for (int dd = 0; dd < d; dd++)
+      dot += to_float(q_row[dd]) * to_float(k_row[dd]);
+    s_score[j] = dot * scale;
+  }
   __syncthreads();
 
-  // running 状态:m/l 每个线程各持一份相同副本;acc 每线程负责通道 dd=tid
-  float m = -INFINITY, l = 0.f, acc = 0.f;
+  // ---- 阶段 B: 求 max —— 就是 rmsNorm 的折半归约, 把 + 换成 fmaxf ----
+  // 每个线程先对自己的 j 集合求局部 max → 写入归约数组 → 折半归约
+  //       结果 m = 全局最大 s_j
 
-  // causal: 只需扫到 j<=t;否则扫到 src_len
-  int jend = src_len;
-  if (is_causal && t + 1 < jend)
-    jend = t + 1;
-
-  for (int j0 = 0; j0 < jend; j0 += nthreads) {
-    int j = j0 + tid;
-
-    // (1) 本线程负责 key j 的打分 s = (q·k_j) * scale;越界/被 mask 记 -inf
-    float s = -INFINITY;
-    if (j < jend) {
-      const T *k_row = k + (((size_t)b * src_len + j) * kv_heads + hkv) * d;
-      float dot = 0.f;
-      for (int dd = 0; dd < d; dd++)
-        dot += sh_q[dd] * to_float(k_row[dd]);
-      s = dot * scale;
-    }
-
-    // (2) tile 内最大值(折半归约)
-    sh_red[tid] = s;
+  // 找到最大的值
+  float local_max = -INFINITY;
+  for (int j = tid; j < src_len; j += nthreads)
+    local_max = fmaxf(local_max, s_score[j]);
+  red[tid] = local_max;
+  __syncthreads();
+  for (int s = nthreads / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      red[tid] = fmaxf(red[tid], red[tid + s]);
     __syncthreads();
-    for (int r = nthreads / 2; r > 0; r >>= 1) {
-      if (tid < r)
-        sh_red[tid] = fmaxf(sh_red[tid], sh_red[tid + r]);
-      __syncthreads();
-    }
-    float tile_max = sh_red[0];
-    __syncthreads();
-
-    // (3) 更新 running max,并算校正因子 alpha = exp(m_old - m_new)
-    float m_new = fmaxf(m, tile_max);
-    float alpha = __expf(m - m_new);
-
-    // (4) 本 key 的 exp 权重(相对新基准 m_new)
-    float p = (j < jend) ? __expf(s - m_new) : 0.f;
-    sh_p[tid] = p;
-
-    // (5) tile 内权重和(折半归约)
-    sh_red[tid] = p;
-    __syncthreads();
-    for (int r = nthreads / 2; r > 0; r >>= 1) {
-      if (tid < r)
-        sh_red[tid] += sh_red[tid + r];
-      __syncthreads();
-    }
-    float tile_sum = sh_red[0];
-    __syncthreads();
-
-    // (6) 更新归一化分母: l = alpha*l + 本 tile 权重和
-    l = alpha * l + tile_sum;
-
-    // (7) 更新输出累加:线程 tid 负责通道 dd=tid
-    if (tid < d) {
-      float delta = 0.f;
-      int cnt = jend - j0;
-      if (cnt > nthreads)
-        cnt = nthreads;
-      for (int jj = 0; jj < cnt; jj++) {
-        const T *v_row =
-            v + (((size_t)b * src_len + (j0 + jj)) * kv_heads + hkv) * d;
-        delta += sh_p[jj] * to_float(v_row[tid]);
-      }
-      acc = alpha * acc + delta;
-    }
-    m = m_new;
-    __syncthreads(); // 复用 sh_p/sh_red 前同步
   }
+  float m = red[0]; // 全Block都能读
+  __syncthreads();
 
-  // (8) 归一化写回
-  if (tid < d)
-    o_row[tid] = from_float<T>(acc / l);
+  // ---- 阶段 C: s_j = exp(s_j - m), 再归约求和得 l ----
+  // 原地改写 s_shared[j] = __expf(s_shared[j] - m)
+  // 再做一次加法归约(和 rmsNorm 一模一样)得到 l
+  float local_sum = 0.f;
+  for (int j = tid; j < src_len; j += nthreads) {
+    float e = __expf(s_score[j] - m);
+    s_score[j] = e;
+    local_sum += e;
+  }
+  red[tid] = local_sum;
+  __syncthreads();
+  for (int s = nthreads / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  float l = red[0];
+  __syncthreads();
+
+  // ---- 阶段 D: 线程按 d 通道分工, o[d] = Σ_j p_j * v[j][d] / l ----
+  for (int dd = threadIdx.x; dd < d; dd += blockDim.x) {
+    float acc = 0.f;
+    // 循环所有 j: acc += s_score[j] * v_row[dd](p_j 最后再除 l)
+    for (int j = 0; j < src_len; j++) {
+      const T *v_row = v + (((size_t)b * src_len + j) * kv_heads + hkv) * d;
+      acc += s_score[j] * to_float(v_row[dd]);
+    }
+    o_row[dd] = from_float<T>(acc / l);
+  }
 }
 
 // Hidden_dim == num_heads * head_dim.
@@ -293,8 +273,8 @@ void flashAttention(const std::vector<T> &h_q, const std::vector<T> &h_k,
   // 三维网格，天然映射, 剩下的一个就是head dim
   dim3 grid(batch_size, target_seq_len, query_heads);
   int threads = 128;
-  // 共享内存: sh_q[head_dim] + sh_p[threads] + sh_red[threads]
-  size_t shmem = ((size_t)head_dim + 2 * threads) * sizeof(float);
+  // s_score[src_len] + red[threads] 两块区域，缺一不可！
+  size_t shmem = ((size_t)src_seq_len + threads) * sizeof(float);
   flashAttentionKernel<T><<<grid, threads, shmem>>>(
       d_q, d_k, d_v, d_o, target_seq_len, src_seq_len, query_heads, kv_heads,
       head_dim, is_causal);
