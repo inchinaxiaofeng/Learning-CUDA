@@ -16,10 +16,13 @@ namespace hadamard {
 namespace {
 
 // Sylvester construction: H_1 = [1], H_2n = [[H_n, H_n], [H_n, -H_n]].
+//
+// The dimension n is tracked explicitly: h.size() is n*n, so taking the element count
+// as the dimension made the loop index past the end of h as soon as n > 2.
 std::vector<float> build_sylvester(int d) {
+    int n = 1;
     std::vector<float> h(1, 1.0f);
-    while (static_cast<int>(h.size()) < d) {
-        const int n = static_cast<int>(h.size());
+    while (n < d) {
         std::vector<float> next(static_cast<size_t>(4) * n * n, 0.0f);
         for (int i = 0; i < n; ++i) {
             for (int j = 0; j < n; ++j) {
@@ -33,6 +36,7 @@ std::vector<float> build_sylvester(int d) {
             }
         }
         h.swap(next);
+        n *= 2;
     }
     return h;
 }
