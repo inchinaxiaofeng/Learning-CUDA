@@ -45,7 +45,9 @@ inline float tolerance_for(DType dtype) {
     return dtype == DType::kFp16 ? kAtolFp16 : kAtolBf16;
 }
 
-inline bool is_power_of_two(int n) { return n > 0 && (n & (n - 1)) == 0; }
+inline bool is_power_of_two(int n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
 
 inline int log2_int(int n) {
     int k = 0;

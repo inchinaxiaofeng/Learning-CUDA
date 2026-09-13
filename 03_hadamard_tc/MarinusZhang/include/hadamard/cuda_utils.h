@@ -23,7 +23,7 @@ inline void check_cuda(cudaError_t status, const char* expr, const char* file, i
 // Wall-clock timing of GPU work through CUDA events, reported in milliseconds,
 // which is the metric the project asks for.
 class CudaEventTimer {
-  public:
+   public:
     CudaEventTimer() {
         HW_CUDA_CHECK(cudaEventCreate(&start_));
         HW_CUDA_CHECK(cudaEventCreate(&stop_));
@@ -48,7 +48,7 @@ class CudaEventTimer {
         return ms;
     }
 
-  private:
+   private:
     cudaEvent_t start_{};
     cudaEvent_t stop_{};
 };

@@ -49,8 +49,8 @@ void skip(const std::string& name, const std::string& detail) {
 }
 
 std::string fmt(const Case& c) {
-    return "d=" + std::to_string(c.head_dim) + " rows=" +
-           std::to_string(static_cast<long>(c.batch) * c.seq_len * c.num_heads);
+    return "d=" + std::to_string(c.head_dim) +
+           " rows=" + std::to_string(static_cast<long>(c.batch) * c.seq_len * c.num_heads);
 }
 
 float max_abs_diff(const float* a, const float* b, long n) {
@@ -109,16 +109,14 @@ void test_precision_roundtrip() {
         unpack_fp32(packed.data(), n, back.data(), dtype);
         const float diff = max_abs_diff(x.data(), back.data(), n);
         const float limit = 0.1f * tolerance_for(dtype);
-        report(diff <= limit,
-               std::string("precision round-trip ") + dtype_name(dtype),
+        report(diff <= limit, std::string("precision round-trip ") + dtype_name(dtype),
                "max|diff|=" + std::to_string(diff) + " limit=" + std::to_string(limit));
     }
 }
 
 // Full GPU comparison, ready for M2/M3. Reports SKIP while the launcher is a stub.
-void test_gpu_implementation(const char* impl_name,
-                             bool (*launch)(const void*, void*, const Shape&, DType,
-                                            cudaStream_t)) {
+void test_gpu_implementation(const char* impl_name, bool (*launch)(const void*, void*, const Shape&,
+                                                                   DType, cudaStream_t)) {
     for (const Case& c : kCases) {
         const Shape shape{c.batch, c.seq_len, c.num_heads, c.head_dim};
         const long rows = shape.rows();
@@ -142,8 +140,8 @@ void test_gpu_implementation(const char* impl_name,
             void* d_y = nullptr;
             HW_CUDA_CHECK(cudaMalloc(&d_x, n * sizeof(uint16_t)));
             HW_CUDA_CHECK(cudaMalloc(&d_y, n * sizeof(uint16_t)));
-            HW_CUDA_CHECK(cudaMemcpy(d_x, packed_x.data(), n * sizeof(uint16_t),
-                                     cudaMemcpyHostToDevice));
+            HW_CUDA_CHECK(
+                cudaMemcpy(d_x, packed_x.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice));
 
             const bool available = launch(d_x, d_y, shape, dtype, nullptr);
             if (!available) {
@@ -154,8 +152,8 @@ void test_gpu_implementation(const char* impl_name,
             }
 
             std::vector<uint16_t> packed_y(n);
-            HW_CUDA_CHECK(cudaMemcpy(packed_y.data(), d_y, n * sizeof(uint16_t),
-                                     cudaMemcpyDeviceToHost));
+            HW_CUDA_CHECK(
+                cudaMemcpy(packed_y.data(), d_y, n * sizeof(uint16_t), cudaMemcpyDeviceToHost));
             HW_CUDA_CHECK(cudaFree(d_x));
             HW_CUDA_CHECK(cudaFree(d_y));
 
