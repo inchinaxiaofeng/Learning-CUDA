@@ -5,12 +5,14 @@
 // irrelevant here (the O(d^2) matmul only runs on small shapes).
 #include "hadamard/hadamard.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 namespace hadamard {
 namespace {
@@ -41,7 +43,53 @@ std::vector<float> build_sylvester(int d) {
     return h;
 }
 
+// E4M3 (S1E4M3, bias 7) decode, written out by hand: the host fallback in cuda_fp8.h
+// is what the kernels are compared against, so decoding with the same header would
+// not prove anything. exp == 0 encodes subnormals (mantissa * 2^-6 / 8); exponent 15
+// with mantissa 7 is NaN, which the quantizer never produces for finite input.
+float decode_e4m3(uint8_t code) {
+    const int sign = (code >> 7) & 1;
+    const int exponent = (code >> 3) & 0xF;
+    const int mantissa = code & 0x7;
+    const float fraction = static_cast<float>(mantissa) * 0.125f;  // mantissa / 8
+    const float value = exponent == 0
+                            ? fraction * 0.015625f  // 2^-6
+                            : (1.0f + fraction) * std::exp2(static_cast<float>(exponent - 7));
+    return sign != 0 ? -value : value;
+}
+
 }  // namespace
+
+float fp8_e4m3_dequant(uint8_t code) {
+    return decode_e4m3(code);
+}
+
+void ref_quant_scales_fp8(const float* y, float* scales, long rows, int d) {
+    for (long r = 0; r < rows; ++r) {
+        float amax = 0.0f;
+        for (int i = 0; i < d; ++i) {
+            amax = std::max(amax, std::fabs(y[r * d + i]));
+        }
+        scales[r] = fp8_e4m3_scale(amax);
+    }
+}
+
+void ref_quantize_fp8(const float* y, const float* scales, uint8_t* q, long rows, int d) {
+    for (long r = 0; r < rows; ++r) {
+        const float rscale = 1.0f / scales[r];
+        for (int i = 0; i < d; ++i) {
+            q[r * d + i] = __nv_cvt_float_to_fp8(y[r * d + i] * rscale, __NV_SATFINITE, __NV_E4M3);
+        }
+    }
+}
+
+void ref_dequantize_fp8(const uint8_t* q, const float* scales, long rows, int d, float* y) {
+    for (long r = 0; r < rows; ++r) {
+        for (int i = 0; i < d; ++i) {
+            y[r * d + i] = decode_e4m3(q[r * d + i]) * scales[r];
+        }
+    }
+}
 
 void ref_matmul_fp32(const float* x, float* y, long rows, int d) {
     const std::vector<float> h = build_sylvester(d);

@@ -1,6 +1,7 @@
-// GPU entry points: the M0 toolchain probe, the M2 butterfly FWHT baseline, and the
-// M3 Tensor Core GEMM.
+// GPU entry points: the M0 toolchain probe, the M2 butterfly FWHT baseline, the M3
+// Tensor Core GEMM, and the M4 FP8 E4M3 quantizers (standalone and fused).
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -219,6 +220,48 @@ struct RunIO {
     }
 };
 
+// The butterfly itself, shared by the plain M2 kernel and the fused M4 kernel so that
+// there is exactly one implementation of the transform arithmetic. A row of length d is
+// owned by 2^kLogT lanes of the same warp, each holding kE = d / 2^kLogT contiguous
+// elements. The stage with stride `len` pairs index i with i ^ len:
+//   * len <  kE: both indices are in this thread's own registers -> plain adds;
+//   * len >= kE: the partner is lane ^ (len / kE) at the same element index, so one
+//     __shfl_xor_sync per element is enough, with the sign folded into the sum.
+template <int kLogD, int kLogT>
+struct Butterfly {
+    static constexpr int kE = (1 << kLogD) / (1 << kLogT);
+
+    static __device__ __forceinline__ void run(float (&v)[kE], int lane) {
+        // Stages whose partner sits in this thread's own registers.
+#pragma unroll
+        for (int len = 1; len < kE; len <<= 1) {
+#pragma unroll
+            for (int i = 0; i < kE; ++i) {
+                if ((i & len) == 0) {
+                    const float a = v[i];
+                    const float b = v[i + len];
+                    v[i] = a + b;
+                    v[i + len] = a - b;
+                }
+            }
+        }
+
+        // Stages whose partner is held by another thread of the same row.
+        if constexpr (kLogT > 0) {
+#pragma unroll
+            for (int len = kE; len < (1 << kLogD); len <<= 1) {
+                const int lane_mask = len / kE;
+                const float sign = (lane & lane_mask) != 0 ? -1.0f : 1.0f;
+#pragma unroll
+                for (int i = 0; i < kE; ++i) {
+                    const float other = __shfl_xor_sync(0xffffffffu, v[i], lane_mask, 1 << kLogT);
+                    v[i] = sign * v[i] + other;
+                }
+            }
+        }
+    }
+};
+
 template <typename T, int kLogD, int kLogT>
 __global__ void __launch_bounds__(kMaxThreadsPerBlock)
     fwht_kernel(const T* __restrict__ x, T* __restrict__ y, long num_rows, float scale) {
@@ -239,34 +282,7 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock)
 
     float v[kE];
     RunIO<T, kE>::load(x + row * kD + lane * kE, v);
-
-    // Stages whose partner sits in this thread's own registers.
-#pragma unroll
-    for (int len = 1; len < kE; len <<= 1) {
-#pragma unroll
-        for (int i = 0; i < kE; ++i) {
-            if ((i & len) == 0) {
-                const float a = v[i];
-                const float b = v[i + len];
-                v[i] = a + b;
-                v[i + len] = a - b;
-            }
-        }
-    }
-
-    // Stages whose partner is held by another thread of the same row.
-    if constexpr (kLogT > 0) {
-#pragma unroll
-        for (int len = kE; len < kD; len <<= 1) {
-            const int lane_mask = len / kE;
-            const float sign = (lane & lane_mask) != 0 ? -1.0f : 1.0f;
-#pragma unroll
-            for (int i = 0; i < kE; ++i) {
-                const float other = __shfl_xor_sync(0xffffffffu, v[i], lane_mask, kT);
-                v[i] = sign * v[i] + other;
-            }
-        }
-    }
+    Butterfly<kLogD, kLogT>::run(v, lane);
 
     if (owns_row) {
         RunIO<T, kE>::store(y + row * kD + lane * kE, v, scale);
@@ -283,25 +299,33 @@ int target_block_count() {
     return cached;
 }
 
+// Block shape shared by the FWHT and the quantizer launchers: a few blocks per SM,
+// whole warps, at or below kMaxThreadsPerBlock, and a multiple of the row's thread
+// count so that every thread belongs to a row.
+struct BlockShape {
+    int threads;
+    int rows_per_block;
+};
+
+BlockShape choose_block_shape(long rows, int threads_per_row) {
+    const long wanted = std::max<long>(1, (rows + target_block_count() - 1) / target_block_count());
+    const int max_rows_per_block = kMaxThreadsPerBlock / threads_per_row;
+    const int wanted_rows_per_block = static_cast<int>(std::min<long>(wanted, max_rows_per_block));
+    int threads = std::max(32, ((wanted_rows_per_block * threads_per_row + 31) / 32) * 32);
+    threads = std::min(threads, kMaxThreadsPerBlock);
+    return {threads, threads / threads_per_row};
+}
+
 template <typename T, int kLogD>
 bool launch_fwht_typed(const void* x, void* y, long rows, float scale, cudaStream_t stream) {
     constexpr int kLogT = preferred_log_t(kLogD);
     constexpr int kT = 1 << kLogT;
     static_assert((1 << kLogD) % kT == 0, "threads per row must divide the row length");
 
-    // Block shape: aim for a few blocks per SM, keep whole warps, stay at or below
-    // kMaxThreadsPerBlock, and make sure the block is a multiple of kT so that every
-    // thread belongs to a row.
-    const long wanted = std::max<long>(1, (rows + target_block_count() - 1) / target_block_count());
-    const int max_rows_per_block = kMaxThreadsPerBlock / kT;
-    const int wanted_rows_per_block = static_cast<int>(std::min<long>(wanted, max_rows_per_block));
-    int threads = std::max(32, ((wanted_rows_per_block * kT + 31) / 32) * 32);
-    threads = std::min(threads, kMaxThreadsPerBlock);
-    const int rows_per_block = threads / kT;
-
-    const long blocks = (rows + rows_per_block - 1) / rows_per_block;
+    const BlockShape block = choose_block_shape(rows, kT);
+    const long blocks = (rows + block.rows_per_block - 1) / block.rows_per_block;
     fwht_kernel<T, kLogD, kLogT>
-        <<<static_cast<unsigned>(blocks), static_cast<unsigned>(threads), 0, stream>>>(
+        <<<static_cast<unsigned>(blocks), static_cast<unsigned>(block.threads), 0, stream>>>(
             reinterpret_cast<const T*>(x), reinterpret_cast<T*>(y), rows, scale);
     HW_CUDA_CHECK(cudaGetLastError());
     return true;
@@ -555,6 +579,450 @@ bool launch_tc_dispatch(const void* x, void* y, int d, long rows, float scale,
     }
 }
 
+// ---------------------------------------------------------------------------
+// M4: FP8 E4M3 quantization, standalone and fused into an epilogue
+//
+// The rotated activation is quantized per token: one scale per row, mapping that row's
+// largest magnitude onto 448, the largest E4M3 value. Rounding is the same
+// __nv_cvt_float_to_fp8(__NV_SATFINITE, __NV_E4M3) call the host reference uses, and
+// that call was checked to agree with the device instruction on every rounding
+// boundary of the type before any of this was written.
+//
+// The fused kernels quantize the values the non-fused kernel would have written to
+// memory: they round the accumulated row to the activation type first, take the row
+// maximum of those rounded values, and convert from there. That is what makes
+// "fused == transform then quantize" reproducible byte for byte. Quantizing the raw
+// FP32 accumulator instead would differ by one code wherever the two accumulation
+// orders happen to straddle a rounding boundary, and the whole point of fusing is that
+// the quantized result must not depend on which kernel produced the rotation.
+//
+// The scale is a per-row quantity, so a block has to own whole rows. That is why the
+// Tensor Core version does not split the columns across blocks the way the M3 kernel
+// does, and why it stops at head_dim 512: 16 rows of FP32 staging for the epilogue is
+// 16 * (d + pad) * 4 B, i.e. 33 KiB at d = 512 but 66 KiB at d = 1024, past the 48 KiB
+// static shared memory limit. The butterfly version gets the row maximum from a shuffle
+// over the lanes that share the row, so it covers every d the project supports.
+// ---------------------------------------------------------------------------
+
+// One thread's E output bytes. FP8 is a byte per element, so a run is 2/4/8/16/32 B and
+// the widest vector that divides it is used.
+template <int E>
+__device__ __forceinline__ void store_fp8_run(uint8_t* __restrict__ dst, const uint8_t (&v)[E]) {
+    if constexpr (E % 16 == 0) {
+        for (int i = 0; i < E; i += 16) {
+            reinterpret_cast<uint4*>(dst + i)[0] = reinterpret_cast<const uint4*>(v + i)[0];
+        }
+    } else if constexpr (E % 8 == 0) {
+        for (int i = 0; i < E; i += 8) {
+            reinterpret_cast<uint64_t*>(dst + i)[0] = reinterpret_cast<const uint64_t*>(v + i)[0];
+        }
+    } else if constexpr (E % 4 == 0) {
+        for (int i = 0; i < E; i += 4) {
+            reinterpret_cast<uint32_t*>(dst + i)[0] = reinterpret_cast<const uint32_t*>(v + i)[0];
+        }
+    } else {
+        for (int i = 0; i < E; ++i) {
+            dst[i] = v[i];
+        }
+    }
+}
+
+// Row maximum across the 2^kLogT lanes that share a row, so every lane ends up with it.
+template <int kLogT>
+__device__ __forceinline__ float row_amax_shfl(float local_max) {
+    for (int mask = 1; mask < (1 << kLogT); mask <<= 1) {
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, mask, 1 << kLogT));
+    }
+    return local_max;
+}
+
+// Quantizer only: the second half of the two-stage pipeline. Same thread mapping as the
+// FWHT kernel (2^kLogT lanes per row, kE elements each), so the row maximum is a local
+// reduction plus a shuffle butterfly.
+template <typename T, int kLogD, int kLogT>
+__global__ void __launch_bounds__(kMaxThreadsPerBlock)
+    quantize_fp8_kernel(const T* __restrict__ y, uint8_t* __restrict__ q,
+                        float* __restrict__ scales, long num_rows) {
+    constexpr int kD = 1 << kLogD;
+    constexpr int kT = 1 << kLogT;
+    constexpr int kE = kD / kT;
+
+    const int lane = threadIdx.x & (kT - 1);
+    const int rows_per_block = blockDim.x >> kLogT;
+    long row = static_cast<long>(blockIdx.x) * rows_per_block + (threadIdx.x >> kLogT);
+    const bool owns_row = row < num_rows;
+    if (!owns_row) {
+        row = num_rows - 1;
+    }
+
+    float v[kE];
+    RunIO<T, kE>::load(y + row * kD + lane * kE, v);
+
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kE; ++i) {
+        amax = fmaxf(amax, fabsf(v[i]));
+    }
+    amax = row_amax_shfl<kLogT>(amax);
+    const float row_scale = fp8_e4m3_scale(amax);
+    const float rscale = 1.0f / row_scale;
+
+    alignas(16) uint8_t bytes[kE];
+#pragma unroll
+    for (int i = 0; i < kE; ++i) {
+        bytes[i] = __nv_cvt_float_to_fp8(v[i] * rscale, __NV_SATFINITE, __NV_E4M3);
+    }
+    if (owns_row) {
+        store_fp8_run<kE>(q + row * kD + lane * kE, bytes);
+        if (lane == 0) {
+            scales[row] = row_scale;
+        }
+    }
+}
+
+// Butterfly transform with the quantizer in its epilogue.
+template <typename T, int kLogD, int kLogT>
+__global__ void __launch_bounds__(kMaxThreadsPerBlock)
+    fwht_fp8_kernel(const T* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ scales,
+                    long num_rows, float scale) {
+    constexpr int kD = 1 << kLogD;
+    constexpr int kT = 1 << kLogT;
+    constexpr int kE = kD / kT;
+
+    const int lane = threadIdx.x & (kT - 1);
+    const int rows_per_block = blockDim.x >> kLogT;
+    long row = static_cast<long>(blockIdx.x) * rows_per_block + (threadIdx.x >> kLogT);
+    const bool owns_row = row < num_rows;
+    if (!owns_row) {
+        row = num_rows - 1;
+    }
+
+    float v[kE];
+    RunIO<T, kE>::load(x + row * kD + lane * kE, v);
+    Butterfly<kLogD, kLogT>::run(v, lane);
+
+    // Same rounding as the non-fused kernel's store, then the row maximum of it.
+    T rounded[kE];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kE; ++i) {
+        rounded[i] = TypeTraits<T>::from_float(v[i] * scale);
+        amax = fmaxf(amax, fabsf(TypeTraits<T>::to_float(rounded[i])));
+    }
+    amax = row_amax_shfl<kLogT>(amax);
+    const float row_scale = fp8_e4m3_scale(amax);
+    const float rscale = 1.0f / row_scale;
+
+    alignas(16) uint8_t bytes[kE];
+#pragma unroll
+    for (int i = 0; i < kE; ++i) {
+        bytes[i] = __nv_cvt_float_to_fp8(TypeTraits<T>::to_float(rounded[i]) * rscale,
+                                         __NV_SATFINITE, __NV_E4M3);
+    }
+    if (owns_row) {
+        store_fp8_run<kE>(q + row * kD + lane * kE, bytes);
+        if (lane == 0) {
+            scales[row] = row_scale;
+        }
+    }
+}
+
+template <typename T, int kLogD>
+bool launch_quantize_typed(const void* y, uint8_t* q, float* scales, long rows,
+                           cudaStream_t stream) {
+    constexpr int kLogT = preferred_log_t(kLogD);
+    constexpr int kT = 1 << kLogT;
+    static_assert((1 << kLogD) % kT == 0, "threads per row must divide the row length");
+
+    const BlockShape block = choose_block_shape(rows, kT);
+    const long blocks = (rows + block.rows_per_block - 1) / block.rows_per_block;
+    quantize_fp8_kernel<T, kLogD, kLogT>
+        <<<static_cast<unsigned>(blocks), static_cast<unsigned>(block.threads), 0, stream>>>(
+            reinterpret_cast<const T*>(y), q, scales, rows);
+    HW_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <typename T>
+bool launch_quantize_dispatch(const void* y, uint8_t* q, float* scales, int d, long rows,
+                              cudaStream_t stream) {
+    switch (d) {
+        case 2:
+            return launch_quantize_typed<T, 1>(y, q, scales, rows, stream);
+        case 4:
+            return launch_quantize_typed<T, 2>(y, q, scales, rows, stream);
+        case 8:
+            return launch_quantize_typed<T, 3>(y, q, scales, rows, stream);
+        case 16:
+            return launch_quantize_typed<T, 4>(y, q, scales, rows, stream);
+        case 32:
+            return launch_quantize_typed<T, 5>(y, q, scales, rows, stream);
+        case 64:
+            return launch_quantize_typed<T, 6>(y, q, scales, rows, stream);
+        case 128:
+            return launch_quantize_typed<T, 7>(y, q, scales, rows, stream);
+        case 256:
+            return launch_quantize_typed<T, 8>(y, q, scales, rows, stream);
+        case 512:
+            return launch_quantize_typed<T, 9>(y, q, scales, rows, stream);
+        case 1024:
+            return launch_quantize_typed<T, 10>(y, q, scales, rows, stream);
+        default:
+            return false;  // no instantiation for this row length
+    }
+}
+
+template <typename T, int kLogD>
+bool launch_fwht_fp8_typed(const void* x, uint8_t* q, float* scales, long rows, float scale,
+                           cudaStream_t stream) {
+    constexpr int kLogT = preferred_log_t(kLogD);
+    constexpr int kT = 1 << kLogT;
+    static_assert((1 << kLogD) % kT == 0, "threads per row must divide the row length");
+
+    const BlockShape block = choose_block_shape(rows, kT);
+    const long blocks = (rows + block.rows_per_block - 1) / block.rows_per_block;
+    fwht_fp8_kernel<T, kLogD, kLogT>
+        <<<static_cast<unsigned>(blocks), static_cast<unsigned>(block.threads), 0, stream>>>(
+            reinterpret_cast<const T*>(x), q, scales, rows, scale);
+    HW_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <typename T>
+bool launch_fwht_fp8_dispatch(const void* x, uint8_t* q, float* scales, int d, long rows,
+                              float scale, cudaStream_t stream) {
+    switch (d) {
+        case 2:
+            return launch_fwht_fp8_typed<T, 1>(x, q, scales, rows, scale, stream);
+        case 4:
+            return launch_fwht_fp8_typed<T, 2>(x, q, scales, rows, scale, stream);
+        case 8:
+            return launch_fwht_fp8_typed<T, 3>(x, q, scales, rows, scale, stream);
+        case 16:
+            return launch_fwht_fp8_typed<T, 4>(x, q, scales, rows, scale, stream);
+        case 32:
+            return launch_fwht_fp8_typed<T, 5>(x, q, scales, rows, scale, stream);
+        case 64:
+            return launch_fwht_fp8_typed<T, 6>(x, q, scales, rows, scale, stream);
+        case 128:
+            return launch_fwht_fp8_typed<T, 7>(x, q, scales, rows, scale, stream);
+        case 256:
+            return launch_fwht_fp8_typed<T, 8>(x, q, scales, rows, scale, stream);
+        case 512:
+            return launch_fwht_fp8_typed<T, 9>(x, q, scales, rows, scale, stream);
+        case 1024:
+            return launch_fwht_fp8_typed<T, 10>(x, q, scales, rows, scale, stream);
+        default:
+            return false;  // no instantiation for this row length
+    }
+}
+
+// Columns per warp in the fused Tensor Core kernel. A block owns the whole row, so more
+// warps means fewer column tiles each: kWarps = min(8, d / 64).
+constexpr int kTcFp8ColsPerWarp = 64;
+constexpr int kTcFp8MaxWarps = 8;
+// Biggest head_dim the fused Tensor Core kernel handles; see the section comment above.
+constexpr int kTcFp8MaxDim = 512;
+
+// d / 64 warps keeps 64 columns (4 tiles) per warp, but a single warp makes the per-row
+// epilogue a serial chain of 16 reductions with only 8 lanes doing work at d = 64, and
+// that costs more than the traffic fusion saves. Two warps at 32 columns each is the
+// smallest split that hides it; d = 16 has to stay at one warp because the column count
+// cannot drop below one tile.
+__host__ __device__ constexpr int tc_fp8_warps_for(int d) {
+    if (d < 2 * kTcTile) {
+        return 1;
+    }
+    const int warps = d / kTcFp8ColsPerWarp;
+    return warps < 2 ? 2 : (warps > kTcFp8MaxWarps ? kTcFp8MaxWarps : warps);
+}
+
+// Tensor Core transform with the quantizer in its epilogue. The GEMM itself (the +-H_16
+// tiles, the A staging, the K loop) is the M3 kernel; what differs is that a block owns
+// the whole row and that the epilogue runs three passes instead of one:
+//   store   - fragments land in one shared FP32 tile, one column slice per warp;
+//   reduce  - per-row |maximum| of the values rounded to the activation type;
+//   write   - vectorised scale-and-convert of the same tile.
+template <typename T, int kLogD>
+__global__ void __launch_bounds__(kTcFp8MaxWarps * 32)
+    tc_fwht_fp8_kernel(const T* __restrict__ x, uint8_t* __restrict__ q,
+                       float* __restrict__ scales_out, long num_rows, float scale) {
+    constexpr int kD = 1 << kLogD;
+    constexpr int kWarps = tc_fp8_warps_for(kD);
+    constexpr int kColsPerWarp = kD / kWarps;
+    constexpr int kNTilesPerWarp = kColsPerWarp / kTcTile;
+    constexpr int kKTiles = kD / kTcTile;
+    constexpr int kARowStride = kD + kTcARowPad;
+    constexpr int kEpiRowStride = kD + kTcEpiRowPad;
+    constexpr int kVec = 8;  // 16 B of FP32 in, 8 B of FP8 out per thread
+    constexpr int kVecsPerRow = kD / kVec;
+    static_assert(kColsPerWarp % kTcTile == 0, "the column split must stay tile aligned");
+
+    constexpr int kABytes = kTcTile * kARowStride * static_cast<int>(sizeof(T));
+    constexpr int kTileBytes = kTcTile * kEpiRowStride * static_cast<int>(sizeof(float));
+    constexpr int kMainBytes = kABytes > kTileBytes ? kABytes : kTileBytes;
+
+    __shared__ alignas(16) unsigned char s_main[kMainBytes];
+    __shared__ T s_h16_pos[kTcTile * kTcTile];
+    __shared__ T s_h16_neg[kTcTile * kTcTile];
+    __shared__ float s_amax[kTcTile];
+    __shared__ float s_rscale[kTcTile];
+
+    T* const s_a = reinterpret_cast<T*>(s_main);
+    float* const s_tile = reinterpret_cast<float*>(s_main);
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    // +-H_16 as in M3: 256 entries and as few as 32 threads per block, so this has to be
+    // a strided loop rather than a single guarded store.
+    for (int v = tid; v < kTcTile * kTcTile; v += blockDim.x) {
+        const int i = v / kTcTile;
+        const int j = v % kTcTile;
+        const float s = ((__popc(i & j) & 1) == 0) ? 1.0f : -1.0f;
+        s_h16_pos[v] = TypeTraits<T>::from_float(s);
+        s_h16_neg[v] = TypeTraits<T>::from_float(-s);
+    }
+    __syncthreads();
+
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcTile, kTcTile, kTcTile, T,
+                           nvcuda::wmma::row_major>
+        fb_pos;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcTile, kTcTile, kTcTile, T,
+                           nvcuda::wmma::row_major>
+        fb_neg;
+    nvcuda::wmma::load_matrix_sync(fb_pos, s_h16_pos, kTcTile);
+    nvcuda::wmma::load_matrix_sync(fb_neg, s_h16_neg, kTcTile);
+
+    const long row0 = static_cast<long>(blockIdx.x) * kTcTile;
+    for (int v = tid; v < kTcTile * kD / kVec; v += blockDim.x) {
+        const int row = (v * kVec) / kD;
+        const int col = (v * kVec) % kD;
+        const long src_row = row0 + row < num_rows ? row0 + row : num_rows - 1;
+        reinterpret_cast<uint4*>(s_a + row * kARowStride + col)[0] =
+            reinterpret_cast<const uint4*>(x + src_row * kD + col)[0];
+    }
+    __syncthreads();
+
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kTcTile, kTcTile, kTcTile, float>
+        acc[kNTilesPerWarp];
+#pragma unroll
+    for (int nt = 0; nt < kNTilesPerWarp; ++nt) {
+        nvcuda::wmma::fill_fragment(acc[nt], 0.0f);
+    }
+
+#pragma unroll 1
+    for (int kt = 0; kt < kKTiles; ++kt) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kTcTile, kTcTile, kTcTile, T,
+                               nvcuda::wmma::row_major>
+            fa;
+        nvcuda::wmma::load_matrix_sync(fa, s_a + kt * kTcTile, kARowStride);
+#pragma unroll
+        for (int nt = 0; nt < kNTilesPerWarp; ++nt) {
+            const int n_tile = warp * kNTilesPerWarp + nt;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcTile, kTcTile, kTcTile, T,
+                                   nvcuda::wmma::row_major>
+                fb = ((__popc(kt & n_tile) & 1) == 0) ? fb_pos : fb_neg;
+            nvcuda::wmma::mma_sync(acc[nt], fa, fb, acc[nt]);
+        }
+    }
+
+    // The A staging is dead and the epilogue tile reuses its buffer, and every warp has
+    // to have written its column slice before the row-wise reduction can read it.
+    __syncthreads();
+    for (int nt = 0; nt < kNTilesPerWarp; ++nt) {
+        nvcuda::wmma::store_matrix_sync(s_tile + warp * kColsPerWarp + nt * kTcTile, acc[nt],
+                                        kEpiRowStride, nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    // Per-row maximum, rows spread over the warps, 32 lanes sweeping a row each and a
+    // shuffle butterfly to finish. Taken from the shared tile rather than from the
+    // accumulator fragments on purpose: the mapping of fragment elements to matrix
+    // entries is not part of the WMMA contract.
+    for (int r = warp; r < kTcTile; r += kWarps) {
+        const float* const row_ptr = s_tile + r * kEpiRowStride;
+        float amax = 0.0f;
+        for (int vi = lane; vi < kVecsPerRow; vi += 32) {
+            const float* const src = row_ptr + vi * kVec;
+#pragma unroll
+            for (int i = 0; i < kVec; ++i) {
+                const T rounded = TypeTraits<T>::from_float(src[i] * scale);
+                amax = fmaxf(amax, fabsf(TypeTraits<T>::to_float(rounded)));
+            }
+        }
+        amax = row_amax_shfl<5>(amax);
+        if (lane == 0) {
+            s_amax[r] = amax;
+        }
+    }
+    __syncthreads();
+    if (tid < kTcTile) {
+        s_rscale[tid] = 1.0f / fp8_e4m3_scale(s_amax[tid]);
+    }
+    __syncthreads();
+
+    // Strided over the whole block rather than over one warp: every (row, vector) pair is
+    // written exactly once, instead of once per warp.
+    for (int v = tid; v < kTcTile * kVecsPerRow; v += blockDim.x) {
+        const int row = v / kVecsPerRow;
+        const int vec_in_row = v % kVecsPerRow;
+        const long dst_row = row0 + row;
+        if (dst_row >= num_rows) {
+            continue;
+        }
+        const float* const src = s_tile + row * kEpiRowStride + vec_in_row * kVec;
+        const float rscale = s_rscale[row];
+        alignas(16) uint8_t bytes[kVec];
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            const T rounded = TypeTraits<T>::from_float(src[i] * scale);
+            bytes[i] = __nv_cvt_float_to_fp8(TypeTraits<T>::to_float(rounded) * rscale,
+                                             __NV_SATFINITE, __NV_E4M3);
+        }
+        store_fp8_run<kVec>(q + dst_row * kD + vec_in_row * kVec, bytes);
+    }
+    if (tid < kTcTile) {
+        const long dst_row = row0 + tid;
+        if (dst_row < num_rows) {
+            scales_out[dst_row] = fp8_e4m3_scale(s_amax[tid]);
+        }
+    }
+}
+
+template <typename T, int kLogD>
+bool launch_tc_fp8_typed(const void* x, uint8_t* q, float* scales, long rows, float scale,
+                         cudaStream_t stream) {
+    constexpr int kWarps = tc_fp8_warps_for(1 << kLogD);
+    const long row_blocks = (rows + kTcTile - 1) / kTcTile;
+    tc_fwht_fp8_kernel<T, kLogD><<<static_cast<unsigned>(row_blocks), kWarps * 32, 0, stream>>>(
+        reinterpret_cast<const T*>(x), q, scales, rows, scale);
+    HW_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <typename T>
+bool launch_tc_fp8_dispatch(const void* x, uint8_t* q, float* scales, int d, long rows, float scale,
+                            cudaStream_t stream) {
+    switch (d) {
+        case 16:
+            return launch_tc_fp8_typed<T, 4>(x, q, scales, rows, scale, stream);
+        case 32:
+            return launch_tc_fp8_typed<T, 5>(x, q, scales, rows, scale, stream);
+        case 64:
+            return launch_tc_fp8_typed<T, 6>(x, q, scales, rows, scale, stream);
+        case 128:
+            return launch_tc_fp8_typed<T, 7>(x, q, scales, rows, scale, stream);
+        case 256:
+            return launch_tc_fp8_typed<T, 8>(x, q, scales, rows, scale, stream);
+        case 512:
+            return launch_tc_fp8_typed<T, 9>(x, q, scales, rows, scale, stream);
+        default:
+            return false;  // no instantiation for this row length
+    }
+}
+
 }  // namespace
 
 void launch_hello(int* out, int value, cudaStream_t stream) {
@@ -600,6 +1068,50 @@ bool launch_hadamard_tc(const void* x, void* y, const Shape& shape, DType dtype,
                ? launch_tc_dispatch<__half>(x, y, shape.head_dim, shape.rows(), scale, stream)
                : launch_tc_dispatch<__nv_bfloat16>(x, y, shape.head_dim, shape.rows(), scale,
                                                    stream);
+}
+
+bool launch_quantize_fp8(const void* y, uint8_t* q, float* scales, const Shape& shape, DType dtype,
+                         cudaStream_t stream) {
+    if (y == nullptr || q == nullptr || scales == nullptr || !shape.valid() || shape.rows() <= 0) {
+        return false;
+    }
+    return dtype == DType::kFp16 ? launch_quantize_dispatch<__half>(y, q, scales, shape.head_dim,
+                                                                    shape.rows(), stream)
+                                 : launch_quantize_dispatch<__nv_bfloat16>(
+                                       y, q, scales, shape.head_dim, shape.rows(), stream);
+}
+
+bool launch_fwht_baseline_fp8(const void* x, uint8_t* q, float* scales, const Shape& shape,
+                              DType dtype, cudaStream_t stream) {
+    if (x == nullptr || q == nullptr || scales == nullptr || !shape.valid() || shape.rows() <= 0) {
+        return false;
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
+    return dtype == DType::kFp16 ? launch_fwht_fp8_dispatch<__half>(x, q, scales, shape.head_dim,
+                                                                    shape.rows(), scale, stream)
+                                 : launch_fwht_fp8_dispatch<__nv_bfloat16>(
+                                       x, q, scales, shape.head_dim, shape.rows(), scale, stream);
+}
+
+bool launch_hadamard_tc_fp8(const void* x, uint8_t* q, float* scales, const Shape& shape,
+                            DType dtype, cudaStream_t stream) {
+    if (x == nullptr || q == nullptr || scales == nullptr || !shape.valid() || shape.rows() <= 0) {
+        return false;
+    }
+    // Below one m16n16k16 tile there is nothing for the Tensor Cores to do; above
+    // kTcFp8MaxDim the FP32 epilogue tile would not fit in static shared memory. Both
+    // ends are covered by the butterfly quantizer, which shares this scale convention.
+    if (shape.head_dim < kTcTile) {
+        return launch_fwht_baseline_fp8(x, q, scales, shape, dtype, stream);
+    }
+    if (shape.head_dim > kTcFp8MaxDim) {
+        return false;
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
+    return dtype == DType::kFp16 ? launch_tc_fp8_dispatch<__half>(x, q, scales, shape.head_dim,
+                                                                  shape.rows(), scale, stream)
+                                 : launch_tc_fp8_dispatch<__nv_bfloat16>(
+                                       x, q, scales, shape.head_dim, shape.rows(), scale, stream);
 }
 
 }  // namespace hadamard

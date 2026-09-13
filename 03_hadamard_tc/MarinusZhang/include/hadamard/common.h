@@ -41,6 +41,11 @@ inline const char* dtype_name(DType dtype) {
 constexpr float kAtolFp16 = 1e-2f;
 constexpr float kAtolBf16 = 5e-2f;
 
+// FP8 E4M3 (S1E4M3, exponent bias 7) tops out at 448. A per-token scale maps the
+// largest magnitude of that row onto it: scale = amax / kFp8E4M3Max, and
+// dequantisation is value = code_value * scale.
+constexpr float kFp8E4M3Max = 448.0f;
+
 inline float tolerance_for(DType dtype) {
     return dtype == DType::kFp16 ? kAtolFp16 : kAtolBf16;
 }

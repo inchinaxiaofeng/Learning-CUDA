@@ -93,6 +93,99 @@ void bench_gpu_implementation(const char* impl_name,
     HW_CUDA_CHECK(cudaFree(d_y));
 }
 
+template <typename Fn>
+double time_gpu(Fn&& fn) {
+    hadamard::CudaEventTimer timer;
+    fn();  // warm-up
+    timer.start();
+    for (int i = 0; i < kGpuIters; ++i) {
+        fn();
+    }
+    timer.stop();
+    return timer.elapsed_ms() / kGpuIters;
+}
+
+// FP8 rows. The byte model is the point of these rows: a fused kernel reads the
+// activation once and writes the codes, a two-stage pipeline pays for the transform's
+// own read/write as well. Per-row scales add 4 B per row, i.e. 4/d B per element.
+size_t fp8_code_bytes(long n, long rows) {
+    return static_cast<size_t>(n) + static_cast<size_t>(rows) * sizeof(float);
+}
+
+void bench_gpu_fp8(const char* impl_name,
+                   bool (*launch)(const void*, uint8_t*, float*, const hadamard::Shape&,
+                                  hadamard::DType, cudaStream_t),
+                   const BenchCase& c, hadamard::DType dtype) {
+    using namespace hadamard;
+    const Shape shape{c.batch, c.seq_len, c.num_heads, c.head_dim};
+    const long n = shape.elems();
+    const long rows = shape.rows();
+    const size_t bytes = static_cast<size_t>(n) * sizeof(uint16_t) + fp8_code_bytes(n, rows);
+
+    void* d_x = nullptr;
+    uint8_t* d_q = nullptr;
+    float* d_s = nullptr;
+    HW_CUDA_CHECK(cudaMalloc(&d_x, static_cast<size_t>(n) * sizeof(uint16_t)));
+    HW_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_q), static_cast<size_t>(n)));
+    HW_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_s), rows * sizeof(float)));
+    HW_CUDA_CHECK(cudaMemset(d_x, 0, static_cast<size_t>(n) * sizeof(uint16_t)));
+
+    if (!launch(d_x, d_q, d_s, shape, dtype, nullptr)) {
+        std::printf("%-24s %-5s %-16s %10s %10s\n", case_name(c).c_str(), dtype_name(dtype),
+                    impl_name, "n/a", "n/a");
+    } else {
+        const double ms = time_gpu([&] { launch(d_x, d_q, d_s, shape, dtype, nullptr); });
+        std::printf("%-24s %-5s %-16s %10.4f %10.1f\n", case_name(c).c_str(), dtype_name(dtype),
+                    impl_name, ms, effective_bandwidth_gbps(bytes, static_cast<float>(ms)));
+    }
+    HW_CUDA_CHECK(cudaFree(d_x));
+    HW_CUDA_CHECK(cudaFree(d_q));
+    HW_CUDA_CHECK(cudaFree(d_s));
+}
+
+void bench_gpu_fp8_two_stage(const char* impl_name,
+                             bool (*xform)(const void*, void*, const hadamard::Shape&,
+                                           hadamard::DType, cudaStream_t),
+                             bool (*quant)(const void*, uint8_t*, float*, const hadamard::Shape&,
+                                           hadamard::DType, cudaStream_t),
+                             const BenchCase& c, hadamard::DType dtype) {
+    using namespace hadamard;
+    const Shape shape{c.batch, c.seq_len, c.num_heads, c.head_dim};
+    const long n = shape.elems();
+    const long rows = shape.rows();
+    // Transform: read + write an activation tensor. Quantizer: read it back and write
+    // the codes. Both stages are timed together, and both are charged to the byte model.
+    const size_t bytes = 3 * static_cast<size_t>(n) * sizeof(uint16_t) + fp8_code_bytes(n, rows);
+
+    void* d_x = nullptr;
+    void* d_y = nullptr;
+    uint8_t* d_q = nullptr;
+    float* d_s = nullptr;
+    HW_CUDA_CHECK(cudaMalloc(&d_x, static_cast<size_t>(n) * sizeof(uint16_t)));
+    HW_CUDA_CHECK(cudaMalloc(&d_y, static_cast<size_t>(n) * sizeof(uint16_t)));
+    HW_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_q), static_cast<size_t>(n)));
+    HW_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_s), rows * sizeof(float)));
+    HW_CUDA_CHECK(cudaMemset(d_x, 0, static_cast<size_t>(n) * sizeof(uint16_t)));
+
+    const bool available =
+        xform(d_x, d_y, shape, dtype, nullptr) && quant(d_y, d_q, d_s, shape, dtype, nullptr);
+    if (!available) {
+        std::printf("%-24s %-5s %-16s %10s %10s\n", case_name(c).c_str(), dtype_name(dtype),
+                    impl_name, "n/a", "n/a");
+    } else {
+        const double ms = time_gpu([&] {
+            xform(d_x, d_y, shape, dtype, nullptr);
+            quant(d_y, d_q, d_s, shape, dtype, nullptr);
+        });
+        std::printf("%-24s %-5s %-16s %10.4f %10.1f\n", case_name(c).c_str(), dtype_name(dtype),
+                    impl_name, ms, effective_bandwidth_gbps(bytes, static_cast<float>(ms)));
+    }
+    HW_CUDA_CHECK(cudaFree(d_x));
+    HW_CUDA_CHECK(cudaFree(d_y));
+    HW_CUDA_CHECK(cudaFree(d_q));
+    HW_CUDA_CHECK(cudaFree(d_s));
+}
+
 }  // namespace
 
 int main() {
@@ -121,9 +214,22 @@ int main() {
             bench_gpu_implementation("fwht baseline", &launch_fwht_baseline, c, dtype);
             bench_gpu_implementation("tensor core", &launch_hadamard_tc, c, dtype);
         }
+
+        // FP8 rows run on fp16 activations only: bf16 traffic is identical (2 B/elem),
+        // and the interesting question is whether fusing beats doing it in two passes.
+        bench_gpu_fp8("fp8 quantize only", &launch_quantize_fp8, c, DType::kFp16);
+        bench_gpu_fp8("fwht+fp8 fused", &launch_fwht_baseline_fp8, c, DType::kFp16);
+        bench_gpu_fp8("tc+fp8 fused", &launch_hadamard_tc_fp8, c, DType::kFp16);
+        bench_gpu_fp8_two_stage("tc->fp8 2-stage", &launch_hadamard_tc, &launch_quantize_fp8, c,
+                                DType::kFp16);
+        std::printf("%-24s %-5s %-16s %10s %10s\n", "", "", "", "", "");
     }
 
-    std::printf("\nnotes: GB/s counts one read plus one write of the tensor. Rows whose\n");
-    std::printf("       working set fits in L2 are L2-bound; the last row is DRAM-bound.\n");
+    std::printf("\nnotes: GB/s counts the traffic each row is expected to move. Rows whose\n");
+    std::printf("       working set fits in L2 are L2-bound; the last case is DRAM-bound.\n");
+    std::printf("       Transform rows move 2+2 B/elem. FP8 rows move 2 B/elem in and 1 B/elem\n");
+    std::printf("       out plus 4 B per row of scales, so fusing in 3 B/elem against 7 B/elem\n");
+    std::printf("       for the two-pass pipeline should be worth about 7/3 if both are purely\n");
+    std::printf("       bandwidth-bound, and less when the transform is math-bound in L2.\n");
     return 0;
 }
