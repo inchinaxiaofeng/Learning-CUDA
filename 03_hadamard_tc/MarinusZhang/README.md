@@ -55,9 +55,9 @@ cd build && ctest --output-on-failure
 ```
 include/hadamard/   common.h（shape/dtype/误差门槛）、cuda_utils.h（错误检查/事件计时）、hadamard.h（公开 API）
 src/hadamard_ref.cu CPU FP32 参考：Sylvester 显式 matmul + 蝶形 FWHT + FP16/BF16 打包解包
-src/hadamard_gpu.cu GPU 入口：hello kernel、WMMA identity 探针、M2 寄存器蝶形 FWHT kernel，以及 M3 的接口桩
+src/hadamard_gpu.cu GPU 入口：hello kernel、WMMA identity 探针、M2 寄存器蝶形 FWHT kernel、M3 Tensor Core（WMMA）kernel
 src/probe_main.cu   M0 探针可执行文件
-tests/              对拍框架（GPU 用例在接口桩就绪后自动从 SKIP 变为 PASS/FAIL）
+tests/              对拍框架（M2/M3 两条 GPU 路径各自与参考实现对拍）
 bench/              benchmark 驱动：kernel ms + 有效带宽
 docs/               学习笔记与总结报告
 ```
@@ -68,13 +68,17 @@ docs/               学习笔记与总结报告
 - [x] M1 CPU FP32 参考实现 + 多 shape 对拍框架（FP16/BF16）
 - [x] M2 蝶形 FWHT baseline（`launch_fwht_baseline`）：寄存器内蝶形 + warp shuffle，
       不用 shared memory；10 个 GPU 用例全 PASS，DRAM 受限带宽 943 GB/s（峰值 93%）
-- [ ] M3 WMMA Tensor Core 主实现（`launch_hadamard_tc`）
+- [x] M3 WMMA Tensor Core 主实现（`launch_hadamard_tc`）：把 `X · H_D` 写成 GEMM，K = D 按 16
+      切分；靠 Kronecker 分块只常驻 ±H_16（不存 d×d 矩阵），累加器 FP32、epilogue 里缩放并写回。
+      20 个 GPU 用例全 PASS。支持范围：`d ≥ 16`；`d ∈ {2,4,8}` 无法满足 `m16n16k16` 的 K ≥ 16，
+      自动回落 M2。DRAM 受限的大 shape 与 M2 打平（938 vs 943 GB/s）；L2 常驻的 shape 因为算术
+      强度升到 `D/2` 而变成计算受限，慢 1.5~2.5×（见 `docs/report.md` 第 4 节）。
 - [ ] M4 FP8 E4M3 量化融合 epilogue 与一致性验证
-- [ ] M5 全 shape benchmark + ncu 分析
+- [ ] M5 全 shape benchmark + profiler 分析（本机有 `nsys`、无 `ncu`）
 - [ ] M6 报告
 - [ ] M7 整理与 PR
 
-GPU 实现落地前，`hw_tests` 中相关用例报告 SKIP，`hw_bench` 对应行显示 `n/a`。
+GPU 路径已全部落地；M4（融合量化）未实现前，其相关用例仍报告 SKIP。
 
 ## 对拍与 benchmark 约定
 
