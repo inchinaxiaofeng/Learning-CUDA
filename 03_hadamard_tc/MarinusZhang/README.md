@@ -14,8 +14,8 @@
 （`H_1 = [1]`，`H_2n = [[H_n, H_n], [H_n, -H_n]]`）。`1/sqrt(d)` 使变换正交归一，
 因此连续施加两次等于恒等变换——对拍框架直接利用了这条性质。
 
-权重因子必须在实现任何 kernel 之前与参考实现（如 `fast_hadamard_transform`）对齐，
-否则误差必然超标。详见 `docs/learning_notes.md` 的「待确认约定」一节。
+该约定已与参考实现 `fast_hadamard_transform` 对齐并做了数值验证（d = 2…512、fp16/bf16
+逐元素 bit-exact），详见 `docs/learning_notes.md` 的「已确认的约定」一节。
 
 ## 环境
 
@@ -55,7 +55,7 @@ cd build && ctest --output-on-failure
 ```
 include/hadamard/   common.h（shape/dtype/误差门槛）、cuda_utils.h（错误检查/事件计时）、hadamard.h（公开 API）
 src/hadamard_ref.cu CPU FP32 参考：Sylvester 显式 matmul + 蝶形 FWHT + FP16/BF16 打包解包
-src/hadamard_gpu.cu GPU 入口：hello kernel、WMMA identity 探针，以及 M2/M3 的接口桩
+src/hadamard_gpu.cu GPU 入口：hello kernel、WMMA identity 探针、M2 寄存器蝶形 FWHT kernel，以及 M3 的接口桩
 src/probe_main.cu   M0 探针可执行文件
 tests/              对拍框架（GPU 用例在接口桩就绪后自动从 SKIP 变为 PASS/FAIL）
 bench/              benchmark 驱动：kernel ms + 有效带宽
@@ -66,7 +66,8 @@ docs/               学习笔记与总结报告
 
 - [x] M0 工程骨架：CMake（sm_89）、clang-format、探针跑通
 - [x] M1 CPU FP32 参考实现 + 多 shape 对拍框架（FP16/BF16）
-- [ ] M2 共享内存蝶形 FWHT baseline（`launch_fwht_baseline`）
+- [x] M2 蝶形 FWHT baseline（`launch_fwht_baseline`）：寄存器内蝶形 + warp shuffle，
+      不用 shared memory；10 个 GPU 用例全 PASS，DRAM 受限带宽 943 GB/s（峰值 93%）
 - [ ] M3 WMMA Tensor Core 主实现（`launch_hadamard_tc`）
 - [ ] M4 FP8 E4M3 量化融合 epilogue 与一致性验证
 - [ ] M5 全 shape benchmark + ncu 分析
@@ -81,6 +82,8 @@ GPU 实现落地前，`hw_tests` 中相关用例报告 SKIP，`hw_bench` 对应�
   不混入输入量化误差。
 - 有效带宽按一次读 + 一次写统计（FP16/BF16 为 4 字节/元素）。
 - benchmark 使用 CUDA event 计时，GPU 侧 50 次迭代求均值（含 1 次预热）。
+- 小 shape 的工作集在重复迭代中驻留 L2，其 GB/s 反映 L2 带宽；最后一个形状（256 MiB 流量）
+  超出 72 MiB L2，用来衡量 HBM 受限下的表现。
 
 ## 参考资料
 
