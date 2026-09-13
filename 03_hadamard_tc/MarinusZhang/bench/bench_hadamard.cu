@@ -24,11 +24,16 @@ struct BenchCase {
 };
 
 const BenchCase kCases[] = {
-    {1, 128, 12, 64},
-    {2, 256, 16, 128},
-    {1, 512, 8, 256},
-    {4, 512, 16, 128},
-    {1, 4096, 12, 64},
+    // Traffic (one read plus one write) stays well below the 72 MiB L2 of the target
+    // GPU, so across the timed iterations these rows measure L2-bound bandwidth.
+    {1, 128, 12, 64},   // 0.4 MiB
+    {2, 256, 16, 128},  // 4 MiB
+    {1, 512, 8, 256},   // 4 MiB
+    {4, 512, 16, 128},  // 16 MiB
+    {1, 4096, 12, 64},  // 12 MiB
+    // 8 * 4096 * 16 * 128 elements = 256 MiB of traffic, i.e. larger than L2: this is
+    // the row that shows what the kernel achieves against HBM (see the report).
+    {8, 4096, 16, 128},
 };
 
 constexpr int kGpuIters = 50;
@@ -107,9 +112,8 @@ int main() {
         std::vector<float> x = random_host_data(n, 0xF00Du + c.head_dim);
         std::vector<float> y(n);
         const double cpu_ms = bench_cpu_fwht(x, y, shape.rows(), shape.head_dim);
-        const double cpu_bytes_gbps =
-            effective_bandwidth_gbps(static_cast<size_t>(n) * sizeof(float) * 2,
-                                     static_cast<float>(cpu_ms));
+        const double cpu_bytes_gbps = effective_bandwidth_gbps(
+            static_cast<size_t>(n) * sizeof(float) * 2, static_cast<float>(cpu_ms));
         std::printf("%-24s %-5s %-16s %10.4f %10.1f\n", case_name(c).c_str(), "fp32",
                     "cpu reference", cpu_ms, cpu_bytes_gbps);
 
@@ -119,6 +123,7 @@ int main() {
         }
     }
 
-    std::printf("\nnotes: GB/s counts one read plus one write of the tensor.\n");
+    std::printf("\nnotes: GB/s counts one read plus one write of the tensor. Rows whose\n");
+    std::printf("       working set fits in L2 are L2-bound; the last row is DRAM-bound.\n");
     return 0;
 }
