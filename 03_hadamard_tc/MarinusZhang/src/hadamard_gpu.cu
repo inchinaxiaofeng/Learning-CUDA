@@ -1,5 +1,5 @@
 // GPU entry points: the M0 toolchain probe, the M2 butterfly FWHT baseline, and the
-// M3 Tensor Core entry point (still a stub).
+// M3 Tensor Core GEMM.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -336,6 +336,225 @@ bool launch_fwht_dispatch(const void* x, void* y, int d, long rows, float scale,
     }
 }
 
+// ---------------------------------------------------------------------------
+// M3: the same transform expressed as a GEMM on Tensor Cores
+//
+// Y (M x d) = X (M x d) * H_d (d x d), computed as a tiled WMMA GEMM. Every entry
+// of H_d is +-1, so the B operand is exact in fp16 and bf16 and the error budget
+// stays M2's: FP32 accumulation, one rounding on the way out, 1/sqrt(d) folded into
+// the epilogue.
+//
+// The d x d matrix is never materialised. Sylvester's construction satisfies
+//
+//   H_d[(i1,i0),(j1,j0)] = H_{d/16}[i1,j1] * H_16[i0,j0],   i = 16*i1 + i0,
+//
+// because H_n[i,j] = (-1)^popcount(i&j) and the bits of i1 and i0 do not overlap. So
+// the B tile of a (k, n) tile pair is +H_16 or -H_16, selected by
+// sign = (-1)^popcount(k & n): two 512 B tiles in shared memory, independent of d.
+// Storing H_d outright would need 512 KiB at d = 512, well past the 100 KiB an SM
+// has. (Checked against the recursive construction before writing this: the tile
+// identity holds for every d = 16..1024 and the tiled accumulation reproduces the
+// explicit matmul exactly.)
+//
+// Mapping: a block owns 16 rows and kCols = min(d, 256) output columns; each warp
+// owns kCols / kWarps of those columns and runs the whole K = d loop in steps of 16.
+// The row block is staged in shared memory and padded, because a leading dimension
+// equal to d (a multiple of 64 elements) would pile all 16 rows of a fragment load
+// onto the same banks.
+//
+// The epilogue has to pass through shared memory: a WMMA accumulator fragment holds
+// float, store_matrix_sync can only write a buffer of the fragment's own type, and
+// the output is fp16/bf16. Fragments land in fp32 shared memory, threads pick up
+// their 16 B chunks from there, scale, round and write out; rows past the end of the
+// tensor are simply not stored, which is how row counts smaller than 16 are handled.
+// ---------------------------------------------------------------------------
+
+constexpr int kTcTile = 16;
+// More than one column block only when d exceeds this; 256 keeps the accumulator
+// count per warp at 4 and the shared memory footprint small.
+constexpr int kTcMaxColsPerBlock = 256;
+constexpr int kTcMaxWarps = 4;
+// Shared memory row pads, in elements. Padding is what keeps the rows of a fragment
+// load off the same banks.
+constexpr int kTcARowPad = 8;
+constexpr int kTcEpiRowPad = 8;
+
+// Used from the host launcher and from the kernel, so it needs both annotations (the
+// same trap as the host-only TypeTraits conversion helpers below).
+__host__ __device__ constexpr int tc_warps_for(int cols) {
+    const int warps = cols / kTcTile;
+    return warps < 1 ? 1 : (warps > kTcMaxWarps ? kTcMaxWarps : warps);
+}
+
+template <typename T, int kLogD>
+__global__ void __launch_bounds__(kTcMaxWarps * 32)
+    tc_fwht_kernel(const T* __restrict__ x, T* __restrict__ y, long num_rows, float scale) {
+    constexpr int kD = 1 << kLogD;
+    constexpr int kCols = kD < kTcMaxColsPerBlock ? kD : kTcMaxColsPerBlock;
+    constexpr int kWarps = tc_warps_for(kCols);
+    constexpr int kColsPerWarp = kCols / kWarps;
+    constexpr int kNTilesPerWarp = kColsPerWarp / kTcTile;
+    constexpr int kKTiles = kD / kTcTile;
+    constexpr int kColBlocks = kD / kCols;
+    constexpr int kARowStride = kD + kTcARowPad;
+    constexpr int kEpiRowStride = kColsPerWarp + kTcEpiRowPad;
+    constexpr int kVec = 8;  // 16 B, the widest vector for both element types
+    static_assert(kColsPerWarp % kTcTile == 0, "the column split must stay tile aligned");
+    static_assert(kCols * kColBlocks == kD, "the column blocks must cover the row");
+
+    // The A staging and the fp32 epilogue staging are never live at the same time, so
+    // they share one buffer; the __syncthreads() after the K loop makes that safe.
+    constexpr int kABytes = kTcTile * kARowStride * static_cast<int>(sizeof(T));
+    constexpr int kEpiBytes = kWarps * kTcTile * kEpiRowStride * static_cast<int>(sizeof(float));
+    constexpr int kMainBytes = kABytes > kEpiBytes ? kABytes : kEpiBytes;
+
+    __shared__ alignas(16) unsigned char s_main[kMainBytes];
+    __shared__ T s_h16_pos[kTcTile * kTcTile];
+    __shared__ T s_h16_neg[kTcTile * kTcTile];
+
+    T* const s_a = reinterpret_cast<T*>(s_main);
+    float* const s_epi = reinterpret_cast<float*>(s_main);
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    // +-H_16, with H_16[i][j] = (-1)^popcount(i & j). 256 entries and as few as 32
+    // threads per block, so this has to be a strided loop and not a single guarded
+    // store: writing only the first blockDim.x entries leaves the rest zero, which
+    // silently turns the transform into a partial sum.
+    for (int v = tid; v < kTcTile * kTcTile; v += blockDim.x) {
+        const int i = v / kTcTile;
+        const int j = v % kTcTile;
+        const float s = ((__popc(i & j) & 1) == 0) ? 1.0f : -1.0f;
+        s_h16_pos[v] = TypeTraits<T>::from_float(s);
+        s_h16_neg[v] = TypeTraits<T>::from_float(-s);
+    }
+    __syncthreads();
+
+    // B is the same two fragments for every tile pair, so both stay in registers and
+    // B costs nothing after the prologue.
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcTile, kTcTile, kTcTile, T,
+                           nvcuda::wmma::row_major>
+        fb_pos;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcTile, kTcTile, kTcTile, T,
+                           nvcuda::wmma::row_major>
+        fb_neg;
+    nvcuda::wmma::load_matrix_sync(fb_pos, s_h16_pos, kTcTile);
+    nvcuda::wmma::load_matrix_sync(fb_neg, s_h16_neg, kTcTile);
+
+    // Stage the row block. Rows past the end of the tensor reuse the last real row;
+    // they are excluded from the store at the bottom, so any row count works, including
+    // fewer than 16 rows.
+    const long row0 = static_cast<long>(blockIdx.x) * kTcTile;
+    for (int v = tid; v < kTcTile * kD / kVec; v += blockDim.x) {
+        const int row = (v * kVec) / kD;
+        const int col = (v * kVec) % kD;
+        const long src_row = row0 + row < num_rows ? row0 + row : num_rows - 1;
+        reinterpret_cast<uint4*>(s_a + row * kARowStride + col)[0] =
+            reinterpret_cast<const uint4*>(x + src_row * kD + col)[0];
+    }
+    __syncthreads();
+
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kTcTile, kTcTile, kTcTile, float>
+        acc[kNTilesPerWarp];
+#pragma unroll
+    for (int nt = 0; nt < kNTilesPerWarp; ++nt) {
+        nvcuda::wmma::fill_fragment(acc[nt], 0.0f);
+    }
+
+    const int first_n_tile = blockIdx.y * (kCols / kTcTile) + warp * kNTilesPerWarp;
+// The K loop stays rolled: unroll factors 2 and 4 measured the same within noise,
+// and at d = 1024 a full unroll is 64 fragment loads plus several MMAs each.
+#pragma unroll 1
+    for (int kt = 0; kt < kKTiles; ++kt) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kTcTile, kTcTile, kTcTile, T,
+                               nvcuda::wmma::row_major>
+            fa;
+        nvcuda::wmma::load_matrix_sync(fa, s_a + kt * kTcTile, kARowStride);
+#pragma unroll
+        for (int nt = 0; nt < kNTilesPerWarp; ++nt) {
+            const int n_tile = first_n_tile + nt;
+            // Pick the fragment rather than branching on the sign. Branching made nvcc
+            // predicate both HMMAs and insert a warp sync per mma in the fp16 build, so
+            // the MMA issue slots doubled: the same kernel ran 1.5x slower in fp16 than
+            // in bf16 until this became a select.
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTcTile, kTcTile, kTcTile, T,
+                                   nvcuda::wmma::row_major>
+                fb = ((__popc(kt & n_tile) & 1) == 0) ? fb_pos : fb_neg;
+            nvcuda::wmma::mma_sync(acc[nt], fa, fb, acc[nt]);
+        }
+    }
+    // Every warp has to be done reading the A staging before the epilogue reuses it.
+    __syncthreads();
+
+    float* const s_warp = s_epi + warp * (kTcTile * kEpiRowStride);
+#pragma unroll
+    for (int nt = 0; nt < kNTilesPerWarp; ++nt) {
+        nvcuda::wmma::store_matrix_sync(s_warp + nt * kTcTile, acc[nt], kEpiRowStride,
+                                        nvcuda::wmma::mem_row_major);
+    }
+    // store_matrix_sync distributes the fragment over the lanes in its own layout, so
+    // the reads below need the warp back in step.
+    __syncwarp();
+
+    constexpr int kVecsPerRow = kColsPerWarp / kVec;
+    const int col0 = blockIdx.y * kCols + warp * kColsPerWarp;
+#pragma unroll
+    for (int v = lane; v < kTcTile * kVecsPerRow; v += 32) {
+        const int row = v / kVecsPerRow;
+        const int vec_in_row = v % kVecsPerRow;
+        const long dst_row = row0 + row;
+        if (dst_row >= num_rows) {
+            continue;
+        }
+        const float* const src = s_warp + row * kEpiRowStride + vec_in_row * kVec;
+        alignas(16) T out[kVec];
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+            out[i] = TypeTraits<T>::from_float(src[i] * scale);
+        }
+        reinterpret_cast<uint4*>(y + dst_row * kD + col0 + vec_in_row * kVec)[0] =
+            reinterpret_cast<const uint4*>(out)[0];
+    }
+}
+
+template <typename T, int kLogD>
+bool launch_tc_typed(const void* x, void* y, long rows, float scale, cudaStream_t stream) {
+    constexpr int kD = 1 << kLogD;
+    constexpr int kCols = kD < kTcMaxColsPerBlock ? kD : kTcMaxColsPerBlock;
+    constexpr int kWarps = tc_warps_for(kCols);
+    const long row_blocks = (rows + kTcTile - 1) / kTcTile;
+    const dim3 grid(static_cast<unsigned>(row_blocks), static_cast<unsigned>(kD / kCols));
+    tc_fwht_kernel<T, kLogD><<<grid, kWarps * 32, 0, stream>>>(
+        reinterpret_cast<const T*>(x), reinterpret_cast<T*>(y), rows, scale);
+    HW_CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+template <typename T>
+bool launch_tc_dispatch(const void* x, void* y, int d, long rows, float scale,
+                        cudaStream_t stream) {
+    switch (d) {
+        case 16:
+            return launch_tc_typed<T, 4>(x, y, rows, scale, stream);
+        case 32:
+            return launch_tc_typed<T, 5>(x, y, rows, scale, stream);
+        case 64:
+            return launch_tc_typed<T, 6>(x, y, rows, scale, stream);
+        case 128:
+            return launch_tc_typed<T, 7>(x, y, rows, scale, stream);
+        case 256:
+            return launch_tc_typed<T, 8>(x, y, rows, scale, stream);
+        case 512:
+            return launch_tc_typed<T, 9>(x, y, rows, scale, stream);
+        case 1024:
+            return launch_tc_typed<T, 10>(x, y, rows, scale, stream);
+        default:
+            return false;  // no instantiation for this row length
+    }
+}
+
 }  // namespace
 
 void launch_hello(int* out, int value, cudaStream_t stream) {
@@ -367,14 +586,20 @@ bool launch_fwht_baseline(const void* x, void* y, const Shape& shape, DType dtyp
 
 bool launch_hadamard_tc(const void* x, void* y, const Shape& shape, DType dtype,
                         cudaStream_t stream) {
-    (void)x;
-    (void)y;
-    (void)shape;
-    (void)dtype;
-    (void)stream;
-    // TODO(M3): X_tile (Mtile x d) times the constant matrix H_d (d x d, fp16) via
-    // WMMA, fp32 accumulate, epilogue scaling by 1/sqrt(d).
-    return false;
+    if (x == nullptr || y == nullptr || !shape.valid() || shape.rows() <= 0) {
+        return false;
+    }
+    // One m16n16k16 tile spans 16 columns, so head_dim < 16 cannot be tiled along K at
+    // all. Those sizes go to the register butterfly kernel, which is already exact
+    // there.
+    if (shape.head_dim < kTcTile) {
+        return launch_fwht_baseline(x, y, shape, dtype, stream);
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(shape.head_dim));
+    return dtype == DType::kFp16
+               ? launch_tc_dispatch<__half>(x, y, shape.head_dim, shape.rows(), scale, stream)
+               : launch_tc_dispatch<__nv_bfloat16>(x, y, shape.head_dim, shape.rows(), scale,
+                                                   stream);
 }
 
 }  // namespace hadamard

@@ -4,8 +4,8 @@
 //     y = H_d * x / sqrt(d)
 // with H_d the Sylvester matrix, H_1 = [1] and H_2n = [[H_n, H_n], [H_n, -H_n]].
 // The 1/sqrt(d) factor makes the transform orthonormal: scaled twice it is the
-// identity. TODO(M1): confirm the factor against the reference library before
-// benchmarking.
+// identity. Confirmed against Dao-AILab/fast-hadamard-transform in M2 (same scale
+// convention, bit-exact on every case tested).
 #ifndef HADAMARD_HADAMARD_H_
 #define HADAMARD_HADAMARD_H_
 
@@ -38,10 +38,11 @@ void unpack_fp32(const uint16_t* src, long n, float* dst, DType dtype);
 // ---------------------------------------------------------------------------
 // GPU entry points
 //
-// Each launcher returns false while the implementation is still a stub so the
-// harness reports SKIP instead of FAIL. Milestones fill them in:
-//   launch_fwht_baseline -> M2 (shared-memory butterfly, non Tensor Core)
-//   launch_hadamard_tc   -> M3 (WMMA GEMM against the constant H_d matrix)
+// Both launchers return false only when the shape or element type is unsupported, in
+// which case the harness reports SKIP instead of FAIL:
+//   launch_fwht_baseline -> M2 (register butterfly + warp shuffle, no Tensor Core)
+//   launch_hadamard_tc   -> M3 (WMMA GEMM against the constant H_d matrix; head_dim
+//                           below 16 cannot be tiled along K and falls back to M2)
 // ---------------------------------------------------------------------------
 bool launch_fwht_baseline(const void* x, void* y, const Shape& shape, DType dtype,
                           cudaStream_t stream = nullptr);
