@@ -50,6 +50,9 @@ cd build && ctest --output-on-failure
 
 覆盖目标架构用 `-DCMAKE_CUDA_ARCHITECTURES=89`（默认已是 89）。
 
+不需要自己拼命令：报告 `docs/report.md` 的 §8 列出了上面每条命令与报告里每张表的对应关系，以及
+各份原始日志（`docs/logs/`）的生成方式。
+
 ## 目录结构
 
 ```
@@ -59,7 +62,9 @@ src/hadamard_gpu.cu GPU 入口：hello kernel、WMMA identity 探针、M2 寄存
 src/probe_main.cu   M0 探针可执行文件
 tests/              对拍框架（M2/M3 两条 GPU 路径各自与参考实现对拍）
 bench/              benchmark 驱动：kernel ms + 有效带宽
-docs/               学习笔记与总结报告
+docs/               学习笔记、总结报告与原始日志
+  docs/report.md      交付报告（摘要 / 实现 / 优化历程 / 性能 / 验证 / 结论 / 复现方式 / 附录）
+  docs/logs/          报告引用的原始日志：hw_bench stdout、-Xptxas -v、nsys 统计摘录
 ```
 
 ## 进度
@@ -71,7 +76,7 @@ docs/               学习笔记与总结报告
 - [x] M3 WMMA Tensor Core 主实现（`launch_hadamard_tc`）：把 `X · H_D` 写成 GEMM，K = D 按 16
       切分；靠 Kronecker 分块只常驻 ±H_16（不存 d×d 矩阵），累加器 FP32、epilogue 里缩放并写回。
       20 个 GPU 用例全 PASS。支持范围：`d ≥ 16`；`d ∈ {2,4,8}` 无法满足 `m16n16k16` 的 K ≥ 16，
-      自动回落 M2。DRAM 受限的大 shape 与 M2 打平（938 vs 943 GB/s）；L2 常驻的 shape 因为算术
+      自动回落 M2。DRAM 受限的大 shape 与 M2 打平（935 vs 943 GB/s）；L2 常驻的 shape 因为算术
       强度升到 `D/2` 而变成计算受限，慢 1.5~2.5×（见 `docs/report.md` 第 4 节）。
 - [x] M4 FP8 E4M3 per-token 量化融合（`launch_quantize_fp8` / `launch_fwht_baseline_fp8` /
       `launch_hadamard_tc_fp8`）：融合结果与「先变换后量化」两段式**逐字节一致**（20 个用例码字
@@ -84,7 +89,8 @@ docs/               学习笔记与总结报告
       的占用率表与 `nsys` 时间线作侧证。结论：M2 始终贴住搬运上限；M3 在 `d ≥ 256` 已达裸 mma 峰值
       的 84~90%，但仍比 M2 慢（`D²` 对 `D·log2 D` 的 MAC 差，交叉点约 `d = 110`）；融合量化上蝶形版
       全面优于 TC 版（`d ≥ 16` 快 2.0~6.8×）。见 `docs/report.md` §4。
-- [ ] M6 报告
+- [x] M6 报告：`docs/report.md` 补完为终稿（摘要、§1 验收口径与硬件表、§7 结论、§8 复现方式、
+      附录 A 原始日志 / 附录 B 提交记录）；报告里每个数字都能在 `docs/logs/` 里核到原文
 - [ ] M7 整理与 PR
 
 GPU 路径与 M4 融合量化均已落地：`hw_tests` 共 57 个检查（其中 45 个涉及 GPU），0 failed / 0 skipped；

@@ -1,12 +1,70 @@
 # 作业 03：Hadamard 变换加速（Tensor Core）实现报告
 
-> 骨架文件，随里程碑推进补全；M2（寄存器蝶形 baseline）、M3（Tensor Core GEMM）、M4（FP8 融合量化）
-> 已落地，M5 的全 shape benchmark 与 profiler 侧证见 §4。
+## 摘要
+
+实现沿最后一维的 Hadamard 旋转 `y = H_d·x/√d`（输入 `[B,S,H,D]` 的 fp16/bf16，d 为 2 的幂），
+并把旋转与 FP8 E4M3 per-token 量化融合进同一个 kernel。三条实现路径：
+
+- **M2 寄存器蝶形 + warp shuffle**（`launch_fwht_baseline`）：一行的数据完全驻留在 32 个线程的
+  寄存器里，`len < 8` 的蝶形级用寄存器异或、`len ≥ 8` 用 `__shfl_xor_sync`，全程不碰 shared
+  memory、不需要 `__syncthreads()`。DRAM 受限的 256 MiB shape 跑到 943 GB/s（1008 GB/s 峰值的
+  93.6%，而同 footprint 的一次读 + 一次写拷贝上限是 925 GB/s）；与官方 `fast_hadamard_transform`
+  在 d = 2…512 上**逐元素 bit-exact**（max|diff| = 0）。
+- **M3 Tensor Core（WMMA）**（`launch_hadamard_tc`）：把 `Y = X·H_d` 写成 tiled GEMM，靠 Sylvester
+  的 Kronecker 分块只常驻 ±H_16（不存 d×d 矩阵，smem 用量与 d 无关），累加器全程 FP32。
+- **M4 FP8 融合**（`fwht_fp8_kernel` / `tc_fwht_fp8_kernel`）：直接输出 E4M3 码字 + 每行一个 scale，
+  与「先变换后量化」两段式**逐字节一致**（20 个用例 0 个不同码字、scale 逐位相等）；DRAM 行
+  0.2138 ms vs 两段式 0.4996 ms（2.34×，与 7/3 的流量账吻合）。
+
+三条主要结论（细节见 §4）：
+
+1. **这个问题在 DRAM 上是拷贝受限的**（一读一写，上限就是 memcpy），Tensor Core 不可能带来
+   数量级收益：M2 已经贴在搬运上限上，M3 的价值在于把「FWHT 写成 GEMM」这条路走通、并定量
+   解释它与 M2 的差距。
+2. **M3 的差距来自算法本身的 MAC 数，不是工程实现**：d ≥ 256 时 M3 已达裸 mma 峰值的 84~90%
+   （`-Xptxas -v` 显示全部 instantiation 无 spill，占用率 25~42%，瓶颈不在发射也不在访存），
+   但 `D²` 对 `D·log2 D` 的 MAC 差在 d = 256 / 1024 时是 32× / 100×。实测
+   `M3/M2 ≈ D·BW_M2/(2P)` 在 d ≥ 256 上误差 ≤ 5%，交叉点落在 **d ≈ 110**——本作业的
+   D = 64/128/256 正在这一档，Tensor Core 路线没有胜算。
+3. **融合量化上蝶形版全面优于 TC 版**（d ≥ 16 快 2.0~6.8×）：省下的流量只在访存受限时才变成
+   时间，而 TC 在这些 shape 上本来就是计算受限；融合只在流量收益大于 epilogue 串行链的代价时
+   才划算（d = 16 的融合 TC 比它自己的两段式还慢 2.3×，就是反例）。
+
+验收：`hw_tests` 57 项检查 0 failed / 0 skipped（其中 45 项涉及 GPU），`ctest` 2/2（0.57 s）；
+fp16 最大绝对误差 ≤ 7.4e-4（门槛 1e-2）、bf16 ≤ 7.6e-3（门槛 5e-2）。本文所有数字取自未插桩的
+一次运行，stdout 原文见 `docs/logs/bench_rtx4090d.txt`；占用率与 profiler 依据见
+`docs/logs/ptxas_v_hadamard_gpu.txt` 与 `docs/logs/nsys_stats.txt`（附录 A）。
 
 ## 1. 任务理解
 
-沿最后一维对 `[B, S, H, D]` 做 Hadamard 变换，D 为 2 的幂；要求 FP16 绝对误差 < 1e-2、
-BF16 < 5e-2，并与量化算子融合。详见 `03_hadamard_tc/README.md`。
+**题目**：沿最后一维对 `[batch, seq_len, num_heads, head_dim]` 的 fp16/bf16 张量做 Hadamard
+旋转，`head_dim` 为 2 的幂；要与量化算子融合，「最好基于 Tensor Core」；参考实现是
+`fast_hadamard_transform`（QuaRot 同款）。题面见 `03_hadamard_tc/README.md`。
+
+**交付物**：核函数 + 执行时间日志 + 两条路线的加速对比。对应到本仓库就是 `src/hadamard_gpu.cu`
+里的蝶形 / TC / 融合量化三条 kernel 路径，`hw_tests` / `hw_bench` / `hw_probe` 三个可执行文件，
+本报告，以及 `docs/logs/` 下的原始日志。
+
+**验收口径**（与 harness 一致，也是本文所有误差数字的口径）：
+
+| 项 | 口径 |
+|---|---|
+| 精度 | fp16 绝对误差 < 1e-2、bf16 < 5e-2 |
+| 对拍输入 | 输入先按目标精度取整，参考值在取整后的输入上计算（误差只反映 kernel 误差） |
+| 变换约定 | `y = H_d·x/√d`，Sylvester 构造、自然顺序输出（§2.1 已实测确认与官方实现一致） |
+| FP8 融合 | 与「先变换后量化」两段式**逐字节一致**，不是「误差在容差内」 |
+| 参考基线 | CPU FP32：显式 matmul 与蝶形 FWHT 两条独立实现互相印证 |
+| 范围 | d 为 2 的幂；蝶形覆盖 d = 2…1024，TC 覆盖 d ≥ 16（d < 16 回落蝶形），融合 TC 覆盖 d ∈ [16,512] |
+
+**硬件与工具**（与 `docs/logs/*.txt` 头部一致）：
+
+| 项 | 值 |
+|---|---|
+| GPU | NVIDIA RTX 4090 D（Ada, sm_89, 24 GiB, 114 SM, 1008 GB/s HBM, 72 MiB L2） |
+| 每 SM 资源 | 1536 线程、24 个 block、65536 个寄存器、100 KiB smem（opt-in 每 block 101376 B） |
+| 驱动 / CUDA | 570.124.06 / CUDA 12.8（nvcc V12.8.61，在 `/usr/local/cuda/bin/`，不在默认 PATH） |
+| 构建与格式 | cmake ≥ 3.24、make、g++、clang-format 23.1.1（Google 风格，列宽 100） |
+| profiler | `nsys` 可用；`ncu` 已安装但被权限挡住（§4.3） |
 
 ## 2. 实现思路
 
@@ -253,7 +311,8 @@ M5 补「全 shape + head_dim 扫描」时，先跑出来的两张表本身是�
 
 RTX 4090 D（sm_89，114 SM，1008 GB/s HBM 峰值，72 MiB L2），`hw_bench`，50 次迭代取均值、
 CUDA event 计时（含一次预热）；fp16 与 bf16 的耗时差异在 1% 以内，下表以 fp16 列 ms、bf16 只列
-带宽。L2 常驻的几行逐次运行有 2~3% 抖动。本节所有数字来自同一次 `./build/hw_bench`。
+带宽。L2 常驻的几行逐次运行有 2~3% 抖动。本节所有数字来自同一次 `./build/hw_bench`，stdout 原文
+见 `docs/logs/bench_rtx4090d.txt`（含每个 shape 的 copy 搬运上限行）。
 
 **没有硬件计数器时用什么当对照物。** 这台机器上 `ncu` 不可用（原因见 §4.3），所以每个 shape 都先
 用一个 uint4 的 grid-stride `copy_kernel` 测出「同样 footprint 的一次读 + 一次写」要多久，作为该
@@ -457,8 +516,8 @@ smem 用量（A staging + `H_16` + epilogue tile，随 d 涨到 19~34 KiB）把�
   `d = 2/64/128/256/512` 最大差 2e-6；正交性检查（连续做两次变换应回到原值）对全部尺寸
   通过，可捕获符号、顺序与归一化错误。
 - **GPU 对拍**：`hw_tests` 中 20 个 GPU 用例（fp16/bf16 × `d = 2/64/128/256/512` × M2/TC 两条路径，
-  其中 `d = 2` 由 TC 路径转调 M2）全部 PASS。实测最大绝对误差：fp16 ≤ 7.4e-4（门槛 1e-2），
-  bf16 ≤ 7.6e-3（门槛 5e-2），余量均在 10 倍以上。
+  其中 `d = 2` 由 TC 路径转调 M2）全部 PASS。实测最大绝对误差：fp16 ≤ 7.4e-4（门槛 1e-2，余量
+  13×），bf16 ≤ 7.6e-3（门槛 5e-2，余量 6.6×）。
 - **两条路径相互印证**：TC 用例与 M2 用例的最大误差逐位相同，说明两者都是 FP32 累加、
   只在写回时舍入一次；B 操作数的 ±1 在 fp16/bf16 下精确，所以差异只来自累加顺序，
   完全落在最后一次舍入之内。
@@ -519,3 +578,117 @@ M4 的验证沿用同一口径（输入先按目标精度取整、参考值在�
   以及长依赖链的 stall 原因（验证融合 epilogue 是否真被流量隐藏）。代码级的 `clock64()` 阶段
   分解本轮未做：融合 kernel 的 epilogue 依赖整行归约，分段计时要给每个 block 分配时钟槽位并处理
   跨 warp 读回，成本超过它能回答的问题（§4.3 已经用占用率与延迟探针覆盖了同一结论）。
+
+## 7. 结论
+
+**作业要求与实测对照**：
+
+| 要求 | 门槛 / 目标 | 实测 | 结论 |
+|---|---|---|---|
+| fp16 精度 | 绝对误差 < 1e-2 | ≤ 7.4e-4 | 达标，余量 13× |
+| bf16 精度 | 绝对误差 < 5e-2 | ≤ 7.6e-3 | 达标，余量 6.6× |
+| 非 TC baseline | 自定目标：有效带宽 ≥ 50% 峰值 | DRAM 行 943 GB/s = 93.6% | 达标 |
+| Tensor Core 路径 | 「最好基于 Tensor Core」 | 10 个 TC 用例全部 PASS（从 SKIP 变 PASS）；DRAM 行与 M2 打平（935 vs 943 GB/s） | 达标 |
+| 与量化融合 | 融合且不损精度 | 与两段式逐字节一致；DRAM 行 2.34× | 达标 |
+| 与参考实现对拍 | 与 `fast_hadamard_transform` 一致 | d = 2…512 逐元素 bit-exact（max\|diff\| = 0） | 达标 |
+| 执行时间日志 | 提供 | `docs/logs/bench_rtx4090d.txt`：表 1 的 6 个访存档位各 10 行（fp16/bf16 × 两条变换路径 + copy 上限 + CPU 参考 + 量化三行）；表 2 的 8 个 head_dim × 2 个工作集（4 Mi 元素 + `rows = 1` 延迟探针）各 8 行。逐行带 ms 与按各自流量折算的有效带宽 | 已提供 |
+
+**四条结论**：
+
+1. **瓶颈由访存决定，而本问题的访存下限就是一读一写**。256 MiB shape 上 M2 跑到 943 GB/s，
+   而同 footprint 的 copy 上限是 925 GB/s——已经没有优化空间；M3 也只做到 935 GB/s。所以
+   Tensor Core 在这个问题上的意义不是「更快」，而是「不变慢」并把 GEMM 路线走通。
+2. **M3 慢于 M2 是算法性的，不是工程性的**：d ≥ 256 时它已达裸 mma 峰值的 84~90%，`-Xptxas -v`
+   显示无 spill、占用率 25~42%，`M3/M2 ≈ D·BW_M2/(2P)` 在 d ≥ 256 上误差 ≤ 5%；差距来自
+   `D²` 对 `D·log2 D` 的 MAC 数，交叉点 d ≈ 110。要赢只能改算法（radix-16 hybrid，见 §6）。
+3. **量化融合的收益是流量，不是算力**：7 B/elem → 3 B/elem + 4 B/row 只在访存受限时兑现。
+   蝶形融合在 DRAM 行把变换完全藏进流量（0.2138 ms ≈ 纯量化 0.2139 ms，而 0.2846 × 3/4 = 0.2135
+   也对得上），TC 融合则被 epilogue 的串行链拖住（2.29× vs 2.34×），并且在 d = 16 这种块粒度
+   下变成负收益。
+4. **「逐字节一致」是设计出来的，不是测出来的**：只有先把累加值舍入到目标精度、再对那个值求 amax
+   与量化（§2.4），并且 host 参考与 device kernel 共用同一个舍入入口（1528 个探针 0 处不一致，
+   §2.4 / §5），验收标准才能写成「融合 = 两段式」。从 FP32 累加器直接量化会让两者在极少数
+   边界上差一个码字，那就只剩下误差量级可测了。
+
+方法学上也值得一提：M5 发现 benchmark 自身的三个口径错误（工作集落在 launch 地板上、CPU 参考
+的复杂度用错、搬运上限的措辞写反，见 §3.9）。在没有硬件计数器的容器里，「同 footprint 的搬运
+上限 + `-Xptxas -v` 的占用率 + `nsys` 时间线」三件套足以支撑 §4 的全部结论，但它们能成立的前提
+是口径先对。
+
+**交付物清单**：
+
+- 代码：`include/hadamard/`（shape/dtype/误差门槛与 API）、`src/hadamard_gpu.cu`（M2/M3/M4 的
+  五个 kernel 与对应 launcher，另加 M0 的 hello / WMMA identity 探针）、`src/hadamard_ref.cu`
+  （CPU FP32 参考 + FP8 host 参考）、`tests/test_correctness.cu`（57 项断言）、
+  `bench/bench_hadamard.cu`（两张表 + 搬运上限）、`src/probe_main.cu`（M0 探针）。
+- 文档：`docs/report.md`（本文）、`docs/learning_notes.md`（推导与实测约定）、`README.md`（构建/
+  运行/进度）。
+- 证据：`docs/logs/bench_rtx4090d.txt`、`docs/logs/ptxas_v_hadamard_gpu.txt`、
+  `docs/logs/nsys_stats.txt`。
+
+## 8. 复现方式
+
+**环境**：同 §1 的两张表；`nvcc` 不在默认 PATH，需要先
+
+```
+export PATH=/usr/local/cuda/bin:$PATH
+```
+
+**构建与运行**：
+
+```
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/hw_probe                            # 设备信息 + WMMA identity 探针
+./build/hw_tests                            # 57 项检查，0 failed / 0 skipped
+cd build && ctest --output-on-failure       # 2/2
+./build/hw_bench                            # 两张表（表 1 快，表 2 含 CPU 参考，约一秒）
+```
+
+**各张表与各份日志的生成命令**：
+
+| 报告内容 | 命令 | 归档 |
+|---|---|---|
+| 表 1 / 表 2（§4.1、§4.2、§4.4） | `./build/hw_bench` | `docs/logs/bench_rtx4090d.txt` |
+| 裸 mma 峰值 147.0 / 146.7 TFLOPS（§4 开头） | 仓库外微基准（fragment 常驻寄存器、4 条独立累加器链、无访存） | 数字记在 §4 |
+| 设备上限与 L2 大小（§4.3） | 仓库外 `cudaGetDeviceProperties` 小程序 | 数字记在 §4.3 |
+| 寄存器与占用率（§4.3） | `nvcc -arch=sm_89 -O3 -DNDEBUG -std=c++17 -I include -Xptxas -v -c src/hadamard_gpu.cu -o /tmp/hg_v.o` | `docs/logs/ptxas_v_hadamard_gpu.txt` |
+| nsys 时间线（§4.3） | `nsys profile --force-overwrite=true -o /tmp/m5_nsys --stats=true ./build/hw_bench` | `docs/logs/nsys_stats.txt` |
+| host/device 舍入一致、one-hot 矩阵比对、Kronecker 分块复算（§2.3、§2.4、§5） | 仓库外一次性探针（`/tmp/fp8_*.cu` 等），结论已固化进 `hw_tests` 的断言 | 见 §5 |
+
+**环境限制**：本容器的 `ncu` 不可用（`ERR_NVGPUCTRPERM`、`RmProfilingAdminOnly: 1`，容器内无
+`CAP_SYS_ADMIN`，见 §4.3），因此没有 DRAM 吞吐 / stall / 硬件 occupancy 计数；上表里的替代证据
+链是「搬运上限 + `-Xptxas -v` 占用率 + `nsys` 时间线」。
+
+**已知偏差**：L2 常驻行逐次运行有 2~3% 抖动（本文所有数字取自同一次运行）；表 2 的结论依赖工作集
+大小（4 Mi 元素），换一个工作集可能就又回到 launch 地板——这正是 §3.9 记录的第一个坑。
+
+## 附录 A：原始日志
+
+| 文件 | 内容 | 支撑报告哪一部分 |
+|---|---|---|
+| `docs/logs/bench_rtx4090d.txt` | 未插桩 `hw_bench` 的完整 stdout（259 行） | §4.1 / §4.2 / §4.4 的每一个 ms 与 GB/s，包括每行的 copy 搬运上限与末尾的 notes |
+| `docs/logs/ptxas_v_hadamard_gpu.txt` | `-Xptxas -v` 的 89 个 instantiation（462 行） | §4.3 的「无 spill」与各 kernel 的寄存器数 / 静态 smem |
+| `docs/logs/nsys_stats.txt` | nsys 的 `cuda_api_sum` / `cuda_gpu_kernel_sum` / memset 三段报表 | §4.3 的 launch 地板、`cudaMalloc` 与 memset 的开销说明 |
+
+三份日志都在头部写明了生成命令、时间与读法，归档时未改动 stdout 内容；正文里的数字与它们一致。
+
+## 附录 B：提交记录
+
+从 `upstream/2026-summer-project`（a17ce40）之后的本分支实现轨迹（`git log --oneline`），每个里程碑
+一个代码 commit 加一个文档 commit：
+
+| commit | 里程碑 | 主题 |
+|---|---|---|
+| a043530 | M0 / M1 | 工程骨架（CMake sm_89、clang-format、探针）+ CPU 参考 + 对拍框架 |
+| b0070d2 | — | 提交目录更名为 MarinusZhang |
+| 39d491f | M1 | 修复 `build_sylvester` 的矩阵维度越界（§3.2） |
+| 6aec44c | M1 | clang-format 落到 header 与 harness |
+| 1b56bf6 | M2 | 寄存器蝶形 + warp shuffle 的 FWHT kernel |
+| 0949f41 | M2 | M2 的设计、归一化约定与性能 |
+| 51087fa | M3 | WMMA Tensor Core kernel（Kronecker ±H_16 分块） |
+| 7198bd3 | M3 | M3 设计、踩坑与 M2-vs-TC 性能对比 |
+| 69d3854 | M4 | FP8 E4M3 per-token 量化融合进两条 epilogue |
+| f5a6f55 | M4 | M4 的设计、量化口径与流量账 |
+| f7debe6 | M5 | benchmark 拆成访存档位表 + head_dim 扫描表（含 copy 搬运上限、修正 CPU 门限） |
+| 1724b01 | M5 | 全 shape 结果、占用率侧证与 profiler 权限结论 |
