@@ -75,15 +75,20 @@ docs/               学习笔记与总结报告
       强度升到 `D/2` 而变成计算受限，慢 1.5~2.5×（见 `docs/report.md` 第 4 节）。
 - [x] M4 FP8 E4M3 per-token 量化融合（`launch_quantize_fp8` / `launch_fwht_baseline_fp8` /
       `launch_hadamard_tc_fp8`）：融合结果与「先变换后量化」两段式**逐字节一致**（20 个用例码字
-      0 差异、scale 逐位相等）；DRAM 受限行 0.2141 ms vs 两段式 0.5000 ms（2.34×，与 7/3 的流量账
-      吻合），蝶形融合直接跑在纯量化的带宽上（950 vs 952 GB/s）。支持范围：融合 TC 路径 `d ∈ [16,512]`，
+      0 差异、scale 逐位相等）；DRAM 受限行 0.2138 ms vs 两段式 0.4996 ms（2.34×，与 7/3 的流量账
+      吻合），蝶形融合直接跑在纯量化的带宽上（951 vs 951 GB/s）。支持范围：融合 TC 路径 `d ∈ [16,512]`，
       蝶形融合覆盖 `d = 2…1024`。
-- [ ] M5 全 shape benchmark + profiler 分析（本机有 `nsys`、无 `ncu`）
+- [x] M5 全 shape benchmark + profiler 分析：benchmark 拆成两张表（6 个访存档位 + `d = 8…1024`
+      扫描），每个 shape 都带一行同 footprint 的 `copy_kernel` 作为搬运上限；本容器的 `ncu` 不可用
+      （`ERR_NVGPUCTRPERM`、`RmProfilingAdminOnly: 1`、容器内无 `CAP_SYS_ADMIN`），改用 `-Xptxas -v`
+      的占用率表与 `nsys` 时间线作侧证。结论：M2 始终贴住搬运上限；M3 在 `d ≥ 256` 已达裸 mma 峰值
+      的 84~90%，但仍比 M2 慢（`D²` 对 `D·log2 D` 的 MAC 差，交叉点约 `d = 110`）；融合量化上蝶形版
+      全面优于 TC 版（`d ≥ 16` 快 2.0~6.8×）。见 `docs/report.md` §4。
 - [ ] M6 报告
 - [ ] M7 整理与 PR
 
 GPU 路径与 M4 融合量化均已落地：`hw_tests` 共 57 个检查（其中 45 个涉及 GPU），0 failed / 0 skipped；
-`ctest` 2/2。
+`ctest` 2/2（0.57 s）。M5 改完 benchmark 后重跑无回归。
 
 ## 对拍与 benchmark 约定
 
@@ -95,6 +100,14 @@ GPU 路径与 M4 融合量化均已落地：`hw_tests` 共 57 个检查（其中
 - benchmark 使用 CUDA event 计时，GPU 侧 50 次迭代求均值（含 1 次预热）。
 - 小 shape 的工作集在重复迭代中驻留 L2，其 GB/s 反映 L2 带宽；最后一个形状（256 MiB 流量）
   超出 72 MiB L2，用来衡量 HBM 受限下的表现。
+- 每个 shape 先跑一行同 footprint 的 `copy_kernel`（uint4 grid-stride 的一次读 + 一次写）作为该
+  尺寸下的搬运上限；某一行报出的带宽与它相同时，说明这行已经贴在访存上限上而不是「慢」。融合行
+  只搬 3 B/元素，因此它的**时间**下界是 copy 的 3/4，而**带宽**上限与 4 B/元素的行相同。
+- CPU 参考行只在元素数不超过 `64 · 1024 · 1024` 时测量：`ref_fwht_fp32` 是 `O(d·log2 d)` 的蝶形
+  实现，代价随元素数线性增长，与 `d²` 无关。
+- 表 2（head_dim 扫描）把元素数固定为 4 Mi（16 MiB 流量，留在 L2 内）以隔离 `d` 的影响；表中
+  `rows = 1` 的行是延迟探针（GB/s 列没有意义），`d = 8` 的 TC 行是蝶形回落、`d = 1024` 的融合 TC
+  行不支持，均按实际行为标注。
 
 ## 参考资料
 
