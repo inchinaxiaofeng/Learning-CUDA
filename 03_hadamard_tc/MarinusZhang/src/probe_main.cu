@@ -48,8 +48,7 @@ int main() {
             }
         }
 
-        std::printf("\nstub status    : fwht baseline (M2) and tensor core (M3) not implemented\n");
-        std::printf("M0 probe       : %s\n", failures == 0 ? "OK" : "FAILED");
+        std::printf("\nM0 probe       : %s\n", failures == 0 ? "OK" : "FAILED");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         return 2;

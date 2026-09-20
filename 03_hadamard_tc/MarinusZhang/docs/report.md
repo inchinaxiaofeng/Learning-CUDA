@@ -674,7 +674,7 @@ cd build && ctest --output-on-failure       # 2/2
 | `docs/logs/bench_rtx4090d.txt` | 未插桩 `hw_bench` 的完整 stdout（259 行） | §4.1 / §4.2 / §4.4 的每一个 ms 与 GB/s，包括每行的 copy 搬运上限与末尾的 notes |
 | `docs/logs/ptxas_v_hadamard_gpu.txt` | `-Xptxas -v` 的 89 个 instantiation（462 行） | §4.3 的「无 spill」与各 kernel 的寄存器数 / 静态 smem |
 | `docs/logs/nsys_stats.txt` | nsys 的 `cuda_api_sum` / `cuda_gpu_kernel_sum` / memset 三段报表 | §4.3 的 launch 地板、`cudaMalloc` 与 memset 的开销说明 |
-| `docs/logs/ctest_rtx4090d.txt` | `ctest` 的 `LastTest.log` 原文：`hw_probe` 3 项 + `hw_tests` 57 项（133 行） | 摘要与 §5 的「57 项检查 0 failed / 0 skipped」、fp16 / bf16 最大绝对误差、融合 vs 两段式逐字节一致 |
+| `docs/logs/ctest_rtx4090d.txt` | `ctest` 的 `LastTest.log` 原文：`hw_probe` 3 项 + `hw_tests` 57 项（136 行） | 摘要与 §5 的「57 项检查 0 failed / 0 skipped」、fp16 / bf16 最大绝对误差、融合 vs 两段式逐字节一致 |
 
 四份日志都在头部写明了生成命令、时间与读法，归档时未改动 stdout 内容；正文里的数字与它们一致。
 

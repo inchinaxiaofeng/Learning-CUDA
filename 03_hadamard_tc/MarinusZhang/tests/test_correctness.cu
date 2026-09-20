@@ -114,7 +114,8 @@ void test_precision_roundtrip() {
     }
 }
 
-// Full GPU comparison, ready for M2/M3. Reports SKIP while the launcher is a stub.
+// Full GPU comparison against the CPU reference. Reports SKIP when the launcher rejects the
+// shape or the element type.
 void test_gpu_implementation(const char* impl_name, bool (*launch)(const void*, void*, const Shape&,
                                                                    DType, cudaStream_t)) {
     for (const Case& c : kCases) {
@@ -145,7 +146,7 @@ void test_gpu_implementation(const char* impl_name, bool (*launch)(const void*, 
 
             const bool available = launch(d_x, d_y, shape, dtype, nullptr);
             if (!available) {
-                skip(name, "launcher is still a stub");
+                skip(name, "launcher unsupported for this shape");
                 HW_CUDA_CHECK(cudaFree(d_x));
                 HW_CUDA_CHECK(cudaFree(d_y));
                 continue;
@@ -467,7 +468,7 @@ int main() {
     test_reference_agreement();
     test_orthogonality();
     test_precision_roundtrip();
-    std::printf("\n-- GPU implementations (filled in during M2/M3) --\n");
+    std::printf("\n-- GPU implementations (M2 butterfly, M3 Tensor Core) --\n");
     test_gpu_implementation("fwht baseline", &hadamard::launch_fwht_baseline);
     test_gpu_implementation("tensor core", &hadamard::launch_hadamard_tc);
 

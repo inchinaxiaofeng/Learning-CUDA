@@ -19,6 +19,9 @@
 #     即报告里的 ≤ 7.4e-4（门槛 1e-2）与 ≤ 7.7e-3（门槛 5e-2）。
 #   * hw_probe 输出里的 `stub status : ... not implemented` 是 M0 阶段遗留的过期提示（当时 M2 / M3
 #     还是桩函数），不反映实现状态；两条路径的对拍结果就是下面 hadamard_correctness 里的 20 个 GPU 用例。
+#   * 这一行，以及 hadamard_correctness 里小标题 `-- GPU implementations (filled in during M2/M3) --`
+#     的过期措辞，已在本记录之后的收尾提交里从源码改掉（只改输出字符串与注释，不涉及任何检查逻辑），
+#     所以重新运行得到的输出与本记录只在这两行上不同。
 #
 # 归档时未改动任何字符，直接是 LastTest.log 原文。
 
