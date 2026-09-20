@@ -64,7 +64,7 @@ tests/              对拍框架（M2/M3 两条 GPU 路径各自与参考实现�
 bench/              benchmark 驱动：kernel ms + 有效带宽
 docs/               学习笔记、总结报告与原始日志
   docs/report.md      交付报告（摘要 / 实现 / 优化历程 / 性能 / 验证 / 结论 / 复现方式 / 附录）
-  docs/logs/          报告引用的原始日志：hw_bench stdout、-Xptxas -v、nsys 统计摘录
+  docs/logs/          报告引用的原始日志：hw_bench stdout、-Xptxas -v、nsys 统计摘录、ctest 记录
 ```
 
 ## 进度
@@ -91,7 +91,9 @@ docs/               学习笔记、总结报告与原始日志
       全面优于 TC 版（`d ≥ 16` 快 2.0~6.8×）。见 `docs/report.md` §4。
 - [x] M6 报告：`docs/report.md` 补完为终稿（摘要、§1 验收口径与硬件表、§7 结论、§8 复现方式、
       附录 A 原始日志 / 附录 B 提交记录）；报告里每个数字都能在 `docs/logs/` 里核到原文
-- [ ] M7 整理与 PR
+- [x] M7 整理与 PR：全部源码 `clang-format --dry-run` 0 处违规、全新 Release 构建 0 warning；补充归档
+      `ctest` 原始记录（`docs/logs/ctest_rtx4090d.txt`）；以 PR 提交至 `InfiniTensor/Learning-CUDA` 的
+      `2026-summer-project` 分支，路径 `03_hadamard_tc/MarinusZhang/`
 
 GPU 路径与 M4 融合量化均已落地：`hw_tests` 共 57 个检查（其中 45 个涉及 GPU），0 failed / 0 skipped；
 `ctest` 2/2（0.57 s）。M5 改完 benchmark 后重跑无回归。

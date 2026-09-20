@@ -30,10 +30,10 @@
    时间，而 TC 在这些 shape 上本来就是计算受限；融合只在流量收益大于 epilogue 串行链的代价时
    才划算（d = 16 的融合 TC 比它自己的两段式还慢 2.3×，就是反例）。
 
-验收：`hw_tests` 57 项检查 0 failed / 0 skipped（其中 45 项涉及 GPU），`ctest` 2/2（0.57 s）；
-fp16 最大绝对误差 ≤ 7.4e-4（门槛 1e-2）、bf16 ≤ 7.6e-3（门槛 5e-2）。本文所有数字取自未插桩的
-一次运行，stdout 原文见 `docs/logs/bench_rtx4090d.txt`；占用率与 profiler 依据见
-`docs/logs/ptxas_v_hadamard_gpu.txt` 与 `docs/logs/nsys_stats.txt`（附录 A）。
+验收：`hw_tests` 57 项检查 0 failed / 0 skipped（其中 45 项涉及 GPU），`ctest` 2/2（0.57 s），逐项
+输出见 `docs/logs/ctest_rtx4090d.txt`；fp16 最大绝对误差 ≤ 7.4e-4（门槛 1e-2）、bf16 ≤ 7.7e-3
+（门槛 5e-2）。本文所有性能数字取自未插桩的一次运行，stdout 原文见 `docs/logs/bench_rtx4090d.txt`；
+占用率与 profiler 依据见 `docs/logs/ptxas_v_hadamard_gpu.txt` 与 `docs/logs/nsys_stats.txt`（附录 A）。
 
 ## 1. 任务理解
 
@@ -517,7 +517,8 @@ smem 用量（A staging + `H_16` + epilogue tile，随 d 涨到 19~34 KiB）把�
   通过，可捕获符号、顺序与归一化错误。
 - **GPU 对拍**：`hw_tests` 中 20 个 GPU 用例（fp16/bf16 × `d = 2/64/128/256/512` × M2/TC 两条路径，
   其中 `d = 2` 由 TC 路径转调 M2）全部 PASS。实测最大绝对误差：fp16 ≤ 7.4e-4（门槛 1e-2，余量
-  13×），bf16 ≤ 7.6e-3（门槛 5e-2，余量 6.6×）。
+  13×），bf16 ≤ 7.7e-3（门槛 5e-2，余量 6.5×）；逐项输出见 `docs/logs/ctest_rtx4090d.txt`
+  （fp16 最大 0.000738、bf16 最大 0.007638，都出现在 d = 256）。
 - **两条路径相互印证**：TC 用例与 M2 用例的最大误差逐位相同，说明两者都是 FP32 累加、
   只在写回时舍入一次；B 操作数的 ±1 在 fp16/bf16 下精确，所以差异只来自累加顺序，
   完全落在最后一次舍入之内。
@@ -542,7 +543,8 @@ M4 的验证沿用同一口径（输入先按目标精度取整、参考值在�
 - **全零行**：host 参考与两个融合 kernel 都给出 `scale = 1`、全部码字 `0x00`。
 - **host/device 舍入一致**：见 §2.4，1528 个探针 0 处不一致——这是「逐字节对拍」成立的前提。
 - **不回归**：M5 改完 benchmark 后重跑，M2/M3/M4 的 20 个 GPU 用例仍全部 PASS（`hw_tests`
-  共 57 项断言，0 failed、0 skipped），`ctest` 2/2、用时 0.57 s。
+  共 57 项断言，0 failed、0 skipped），`ctest` 2/2、用时 0.57 s；这次运行的完整记录归档在
+  `docs/logs/ctest_rtx4090d.txt`。
 
 ## 6. 未来工作
 
@@ -586,11 +588,12 @@ M4 的验证沿用同一口径（输入先按目标精度取整、参考值在�
 | 要求 | 门槛 / 目标 | 实测 | 结论 |
 |---|---|---|---|
 | fp16 精度 | 绝对误差 < 1e-2 | ≤ 7.4e-4 | 达标，余量 13× |
-| bf16 精度 | 绝对误差 < 5e-2 | ≤ 7.6e-3 | 达标，余量 6.6× |
+| bf16 精度 | 绝对误差 < 5e-2 | ≤ 7.7e-3 | 达标，余量 6.5× |
 | 非 TC baseline | 自定目标：有效带宽 ≥ 50% 峰值 | DRAM 行 943 GB/s = 93.6% | 达标 |
 | Tensor Core 路径 | 「最好基于 Tensor Core」 | 10 个 TC 用例全部 PASS（从 SKIP 变 PASS）；DRAM 行与 M2 打平（935 vs 943 GB/s） | 达标 |
 | 与量化融合 | 融合且不损精度 | 与两段式逐字节一致；DRAM 行 2.34× | 达标 |
 | 与参考实现对拍 | 与 `fast_hadamard_transform` 一致 | d = 2…512 逐元素 bit-exact（max\|diff\| = 0） | 达标 |
+| 输入：一系列张量形状与类型 | `[B,S,H,D]`，fp16 / bf16，`head_dim` 为 2 的幂 | 形状与类型以内置表给出：`bench/bench_hadamard.cu` 的表 1（6 个 shape × fp16 / bf16）与表 2（`d = 8…1024` 扫描），`tests/test_correctness.cu` 的对拍用例（`d = 2/64/128/256/512` × fp16 / bf16）；性能日志即 `hw_bench` 的 stdout（`./build/hw_bench > perf.log`） | 以内置形状表覆盖 |
 | 执行时间日志 | 提供 | `docs/logs/bench_rtx4090d.txt`：表 1 的 6 个访存档位各 10 行（fp16/bf16 × 两条变换路径 + copy 上限 + CPU 参考 + 量化三行）；表 2 的 8 个 head_dim × 2 个工作集（4 Mi 元素 + `rows = 1` 延迟探针）各 8 行。逐行带 ms 与按各自流量折算的有效带宽 | 已提供 |
 
 **四条结论**：
@@ -624,7 +627,7 @@ M4 的验证沿用同一口径（输入先按目标精度取整、参考值在�
 - 文档：`docs/report.md`（本文）、`docs/learning_notes.md`（推导与实测约定）、`README.md`（构建/
   运行/进度）。
 - 证据：`docs/logs/bench_rtx4090d.txt`、`docs/logs/ptxas_v_hadamard_gpu.txt`、
-  `docs/logs/nsys_stats.txt`。
+  `docs/logs/nsys_stats.txt`、`docs/logs/ctest_rtx4090d.txt`。
 
 ## 8. 复现方式
 
@@ -650,6 +653,7 @@ cd build && ctest --output-on-failure       # 2/2
 | 报告内容 | 命令 | 归档 |
 |---|---|---|
 | 表 1 / 表 2（§4.1、§4.2、§4.4） | `./build/hw_bench` | `docs/logs/bench_rtx4090d.txt` |
+| 正确性检查 57 项 / ctest 2/2（摘要、§5） | `cd build && ctest --output-on-failure` | `docs/logs/ctest_rtx4090d.txt` |
 | 裸 mma 峰值 147.0 / 146.7 TFLOPS（§4 开头） | 仓库外微基准（fragment 常驻寄存器、4 条独立累加器链、无访存） | 数字记在 §4 |
 | 设备上限与 L2 大小（§4.3） | 仓库外 `cudaGetDeviceProperties` 小程序 | 数字记在 §4.3 |
 | 寄存器与占用率（§4.3） | `nvcc -arch=sm_89 -O3 -DNDEBUG -std=c++17 -I include -Xptxas -v -c src/hadamard_gpu.cu -o /tmp/hg_v.o` | `docs/logs/ptxas_v_hadamard_gpu.txt` |
@@ -670,8 +674,9 @@ cd build && ctest --output-on-failure       # 2/2
 | `docs/logs/bench_rtx4090d.txt` | 未插桩 `hw_bench` 的完整 stdout（259 行） | §4.1 / §4.2 / §4.4 的每一个 ms 与 GB/s，包括每行的 copy 搬运上限与末尾的 notes |
 | `docs/logs/ptxas_v_hadamard_gpu.txt` | `-Xptxas -v` 的 89 个 instantiation（462 行） | §4.3 的「无 spill」与各 kernel 的寄存器数 / 静态 smem |
 | `docs/logs/nsys_stats.txt` | nsys 的 `cuda_api_sum` / `cuda_gpu_kernel_sum` / memset 三段报表 | §4.3 的 launch 地板、`cudaMalloc` 与 memset 的开销说明 |
+| `docs/logs/ctest_rtx4090d.txt` | `ctest` 的 `LastTest.log` 原文：`hw_probe` 3 项 + `hw_tests` 57 项（133 行） | 摘要与 §5 的「57 项检查 0 failed / 0 skipped」、fp16 / bf16 最大绝对误差、融合 vs 两段式逐字节一致 |
 
-三份日志都在头部写明了生成命令、时间与读法，归档时未改动 stdout 内容；正文里的数字与它们一致。
+四份日志都在头部写明了生成命令、时间与读法，归档时未改动 stdout 内容；正文里的数字与它们一致。
 
 ## 附录 B：提交记录
 
